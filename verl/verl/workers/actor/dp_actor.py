@@ -401,7 +401,8 @@ class DataParallelPPOActor(BasePPOActor):
                     )
 
                     if entropy_coeff != 0:
-                        entropy_loss = agg_loss(loss_mat=entropy, loss_mask=response_mask, loss_agg_mode=loss_agg_mode)
+                        # 熵正则按每条样本的有效 token 求平均，再对 batch 求平均。
+                        entropy_loss = agg_loss(loss_mat=entropy, loss_mask=response_mask, loss_agg_mode="seq-mean-token-mean")
 
                         # compute policy loss
                         policy_loss = pg_loss - entropy_loss * entropy_coeff
