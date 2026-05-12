@@ -8,9 +8,11 @@ from collections import defaultdict
 from typing import Any
 
 import numpy as np
+from tqdm import tqdm
 
 from .io_utils import get_data_source, write_csv, write_json, write_markdown_table
 from .metrics.distinct import distinct_n
+from .metrics.equational_diversity import equational_diversity
 from .metrics.pass_at_k import compute_pass_metrics
 from .metrics.registry import should_compute_semantic
 from .metrics.self_bleu import self_bleu
@@ -118,7 +120,9 @@ def evaluate_records(
     per_prompt_rows: list[dict[str, Any]] = []
     bucket_rows: dict[tuple[Any, str], list[dict[str, Any]]] = defaultdict(list)
 
-    for (step, data_source, group_key), group_records in sorted(groups.items(), key=lambda item: (str(item[0][0]), item[0][1], item[0][2])):
+    sorted_groups = sorted(groups.items(), key=lambda item: (str(item[0][0]), item[0][1], item[0][2]))
+    print(f"\nComputing per-prompt metrics for {len(sorted_groups)} groups ...")
+    for (step, data_source, group_key), group_records in tqdm(sorted_groups, desc="Per-prompt metrics", unit="group"):
         prompt = str(group_records[0].get("input", ""))
         outputs = [str(record.get("output", "")) for record in group_records]
         row: dict[str, Any] = {
@@ -141,6 +145,8 @@ def evaluate_records(
             row["self_bleu4"] = self_bleu(outputs, max_order=4)
         if semantic_cache is not None:
             row["semantic_cosine"] = average_pairwise_cosine(semantic_cache.get_many(outputs))
+        if "equational-diversity" in metrics:
+            row["equational_diversity"] = equational_diversity(outputs)
 
         per_prompt_rows.append(row)
         bucket_rows[(step, data_source)].append(row)
@@ -175,6 +181,8 @@ def summarize_prompt_rows(step: Any, data_source: str, rows: list[dict[str, Any]
         summary["self_bleu4"] = mean_ignore_none(row.get("self_bleu4") for row in rows)
     if "semantic-cosine" in metrics:
         summary["semantic_cosine"] = mean_ignore_none(row.get("semantic_cosine") for row in rows)
+    if "equational-diversity" in metrics:
+        summary["equational_diversity"] = mean_ignore_none(row.get("equational_diversity") for row in rows)
     return summary
 
 
@@ -215,6 +223,8 @@ def metric_value_keys(metrics: list[str], ks: list[int]) -> list[str]:
         keys.append("self_bleu4")
     if "semantic-cosine" in metrics:
         keys.append("semantic_cosine")
+    if "equational-diversity" in metrics:
+        keys.append("equational_diversity")
     return keys
 
 
@@ -237,6 +247,8 @@ def build_prompt_fieldnames(metrics: list[str], ks: list[int]) -> list[str]:
         fields.append("self_bleu4")
     if "semantic-cosine" in metrics:
         fields.append("semantic_cosine")
+    if "equational-diversity" in metrics:
+        fields.append("equational_diversity")
     fields.append("prompt")
     return fields
 

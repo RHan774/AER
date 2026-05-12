@@ -37,6 +37,25 @@ class SemanticEmbeddingCache:
         self.max_length = max_length
         self._cache: dict[str, np.ndarray] = {}
 
+    def _target_devices(self) -> list[str]:
+        """解析编码设备，支持用逗号分隔多张卡。"""
+
+        return [device.strip() for device in self.device.split(",") if device.strip()]
+
+    def _load_model(self, device: str):
+        """加载 sentence-transformers 模型。"""
+
+        from sentence_transformers import SentenceTransformer
+
+        try:
+            model = SentenceTransformer(self.model_name, device=device, trust_remote_code=True)
+        except TypeError:
+            model = SentenceTransformer(self.model_name, device=device)
+
+        if self.max_length is not None and hasattr(model, "max_seq_length"):
+            model.max_seq_length = self.max_length
+        return model
+
     def encode_missing(self, texts: list[str]) -> None:
         """只编码缓存中不存在的文本。"""
 
@@ -49,21 +68,30 @@ class SemanticEmbeddingCache:
         except ImportError as exc:
             raise RuntimeError("计算 semantic-cosine 需要安装 sentence-transformers") from exc
 
-        try:
-            model = SentenceTransformer(self.model_name, device=self.device, trust_remote_code=True)
-        except TypeError:
-            model = SentenceTransformer(self.model_name, device=self.device)
+        target_devices = self._target_devices()
+        if len(target_devices) > 1:
+            model = self._load_model(device="cpu")
+            pool = model.start_multi_process_pool(target_devices=target_devices)
+            try:
+                embeddings = model.encode_multi_process(
+                    missing_texts,
+                    pool=pool,
+                    batch_size=self.batch_size,
+                    normalize_embeddings=True,
+                    show_progress_bar=True,
+                )
+            finally:
+                SentenceTransformer.stop_multi_process_pool(pool)
+        else:
+            model = self._load_model(device=target_devices[0] if target_devices else "cpu")
+            embeddings = model.encode(
+                missing_texts,
+                batch_size=self.batch_size,
+                convert_to_numpy=True,
+                normalize_embeddings=True,
+                show_progress_bar=True,
+            )
 
-        if self.max_length is not None and hasattr(model, "max_seq_length"):
-            model.max_seq_length = self.max_length
-
-        embeddings = model.encode(
-            missing_texts,
-            batch_size=self.batch_size,
-            convert_to_numpy=True,
-            normalize_embeddings=True,
-            show_progress_bar=True,
-        )
         for idx, text in enumerate(missing_texts):
             self._cache[text] = embeddings[idx]
 

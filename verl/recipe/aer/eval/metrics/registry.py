@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-DEFAULT_METRICS = ["pass@k", "first@1", "distinct-2", "self-bleu", "semantic-cosine"]
+DEFAULT_METRICS = ["pass@k", "first@1", "distinct-2", "self-bleu", "semantic-cosine", "equational-diversity"]
 
 ALIASES = {
     "pass": "pass@k",
@@ -21,6 +21,13 @@ ALIASES = {
     "semantic": "semantic-cosine",
     "semantic_cosine": "semantic-cosine",
     "semantic-cosine": "semantic-cosine",
+    "equational": "equational-diversity",
+    "equational_diversity": "equational-diversity",
+    "equational-diversity": "equational-diversity",
+    "equation": "equational-diversity",
+    "equation_diversity": "equational-diversity",
+    "equation-diversity": "equational-diversity",
+    "ed": "equational-diversity",
 }
 
 

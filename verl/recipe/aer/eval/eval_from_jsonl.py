@@ -31,11 +31,41 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--ks", default="1,2,4,8", help="Pass@K 的 k 列表，逗号分隔")
     parser.add_argument("--correct-threshold", type=float, default=0.5, help="score/acc 大于等于该值视为正确")
     parser.add_argument("--semantic-model", default="/data/models/Qwen/Qwen3-Embedding-0.6B", help="semantic-cosine 使用的 embedding 模型路径")
-    parser.add_argument("--semantic-device", default="cpu", help="semantic-cosine 编码设备")
+    parser.add_argument("--semantic-device", default="cuda", help="semantic-cosine 编码设备；多卡可用逗号分隔，如 cuda:4,cuda:5")
     parser.add_argument("--semantic-batch-size", type=int, default=32, help="semantic-cosine 编码 batch size")
     parser.add_argument("--semantic-max-length", type=int, default=4096, help="semantic-cosine 编码最大长度")
     parser.add_argument("--prompt-preview-chars", type=int, default=120, help="per-prompt CSV 中保留的 prompt 预览长度")
     return parser
+
+
+def evaluate_jsonl_inputs(
+    input_paths: list[str],
+    output_dir: str | Path,
+    metrics: list[str],
+    ks: list[int],
+    correct_threshold: float,
+    semantic_model: str,
+    semantic_device: str,
+    semantic_batch_size: int,
+    semantic_max_length: int,
+    prompt_preview_chars: int,
+) -> None:
+    """从 JSONL 文件读取 rollout 并写出评测结果。"""
+
+    records = load_jsonl_records(input_paths)
+    output_dir = ensure_output_dir(output_dir)
+    summary_rows, per_prompt_rows, summary_fields, prompt_fields = evaluate_records(
+        records=records,
+        metrics=metrics,
+        ks=ks,
+        correct_threshold=correct_threshold,
+        semantic_model=semantic_model,
+        semantic_device=semantic_device,
+        semantic_batch_size=semantic_batch_size,
+        semantic_max_length=semantic_max_length,
+        prompt_preview_chars=prompt_preview_chars,
+    )
+    write_evaluation_outputs(output_dir, summary_rows, per_prompt_rows, summary_fields, prompt_fields)
 
 
 def main(argv: list[str] | None = None) -> None:
@@ -44,11 +74,9 @@ def main(argv: list[str] | None = None) -> None:
     args = build_parser().parse_args(argv)
     metrics = parse_metric_names(args.metrics)
     ks = parse_ks(args.ks)
-    records = load_jsonl_records(args.input)
-    output_dir = ensure_output_dir(args.output_dir)
-
-    summary_rows, per_prompt_rows, summary_fields, prompt_fields = evaluate_records(
-        records=records,
+    evaluate_jsonl_inputs(
+        input_paths=args.input,
+        output_dir=args.output_dir,
         metrics=metrics,
         ks=ks,
         correct_threshold=args.correct_threshold,
@@ -58,7 +86,7 @@ def main(argv: list[str] | None = None) -> None:
         semantic_max_length=args.semantic_max_length,
         prompt_preview_chars=args.prompt_preview_chars,
     )
-    write_evaluation_outputs(output_dir, summary_rows, per_prompt_rows, summary_fields, prompt_fields)
+    output_dir = Path(args.output_dir)
     print(f"已写入 {output_dir / 'validation_summary.csv'}")
     print(f"已写入 {output_dir / 'validation_per_prompt.csv'}")
 

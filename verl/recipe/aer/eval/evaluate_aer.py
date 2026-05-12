@@ -27,7 +27,7 @@ def build_parser() -> argparse.ArgumentParser:
     validation.add_argument("--ks", default="1,2,4,8", help="Pass@K 的 k 列表")
     validation.add_argument("--correct-threshold", type=float, default=0.5, help="score/acc 大于等于该值视为正确")
     validation.add_argument("--semantic-model", default="/data/models/Qwen/Qwen3-Embedding-0.6B", help="semantic-cosine 使用的 embedding 模型")
-    validation.add_argument("--semantic-device", default="cpu", help="semantic-cosine 编码设备")
+    validation.add_argument("--semantic-device", default="cuda", help="semantic-cosine 编码设备；多卡可用逗号分隔，如 cuda:4,cuda:5")
     validation.add_argument("--semantic-batch-size", type=int, default=32, help="semantic-cosine 编码 batch size")
     validation.add_argument("--semantic-max-length", type=int, default=4096, help="semantic-cosine 编码最大长度")
     validation.add_argument("--prompt-preview-chars", type=int, default=120, help="prompt 预览长度")
