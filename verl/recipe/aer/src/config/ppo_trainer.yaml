@@ -700,6 +700,9 @@ algorithm:
   #   - "simhash": SimHash 近重复相似度（快速、低内存）
   similarity_algorithm: "token_match"
 
+  # 额外记录探索奖励指标的算法列表；设为 ["all"] 时使用 similarity 注册表中的所有算法。
+  exploration_metric_algorithms: []
+
   # add: 相似度算法参数
   similarity_params:
 
@@ -726,10 +729,12 @@ algorithm:
 
     # 语义嵌入参数（用于 semantic_embedding）
     model_name: "Qwen/Qwen3-Embedding-0.6B"  # 支持 32K 长文本，推荐用于数学推理
-    batch_size: 32
-    max_length: 4096  # 最大序列长度（匹配 max_response_length）
+    batch_size: 16
+    max_length: 1024  # embedding 模型最大序列长度
+    tail_tokens: 1024  # 只对 response 尾部 token 做语义嵌入，降低 CPU 开销
     device: "cpu"  # 计算设备："cpu" 或 "cuda"（推荐 cpu 避免与训练竞争）
-    num_processes: 1  # 兼容旧配置；当前由 SentenceTransformer batch_size 控制编码并行
+    cuda_visible_devices: null  # semantic_embedding 专用物理 GPU 列表，例如 "4,5,6,7"
+    num_processes: 4  # 多进程分片编码；每个进程持久加载一个 embedding 模型
 
   # Discount factor for future rewards
   gamma: 1.0

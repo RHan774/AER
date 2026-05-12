@@ -161,6 +161,7 @@ class RayAERTrainer(RayPPOTrainer):
                         reward_result = self.reward_fn(batch)
                         reward_tensor_acc = reward_result["reward_tensor_acc"]
                         reward_tensor_exploration = reward_result["reward_tensor_exploration"]
+                        reward_tensors_exploration_by_algorithm = reward_result.get("reward_tensors_exploration_by_algorithm", {})
                         reward_extra_infos_dict = reward_result["reward_extra_info"]
                         batch.non_tensor_batch.update({k: np.array(v) for k, v in reward_extra_infos_dict.items()})
                         
@@ -171,7 +172,11 @@ class RayAERTrainer(RayPPOTrainer):
                         weight = max(0.0, min(1.0, weight))
                         metrics.update({"metric/weight": weight})
                         metrics.update({"metric/acc reward": acc_reward})
-                        metrics.update({"metric/exploration reward": exploration_reward})
+                        if reward_tensors_exploration_by_algorithm:
+                            for algorithm, exploration_tensor in reward_tensors_exploration_by_algorithm.items():
+                                metrics.update({f"metric/exploration reward/{algorithm}": exploration_tensor.sum(-1).mean().item()})
+                        else:
+                            metrics.update({"metric/exploration reward": exploration_reward})
                         
                     # recompute old_log_probs
                     with _timer("old_log_prob", timing_raw):

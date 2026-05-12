@@ -132,6 +132,7 @@ class TaskRunner:
         # add: 获取相似度算法配置
         similarity_algorithm = config.algorithm.get("similarity_algorithm", "token_match")
         similarity_params = config.algorithm.get("similarity_params", {})
+        exploration_metric_algorithms = config.algorithm.get("exploration_metric_algorithms", [])
 
         # add: 将相似度算法配置传递给 reward manager
         reward_fn_kwargs = {
@@ -143,6 +144,7 @@ class TaskRunner:
             "reward_fn_key": config.data.reward_fn_key,
             "similarity_algorithm": similarity_algorithm,
             "similarity_params": similarity_params,
+            "exploration_metric_algorithms": exploration_metric_algorithms,
         }
 
         reward_fn = reward_manager_cls(**reward_fn_kwargs)

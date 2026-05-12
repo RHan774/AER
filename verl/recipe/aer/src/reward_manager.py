@@ -21,7 +21,7 @@ from verl import DataProto
 from math_verify import parse, verify
 
 # add: 导入相似度计算模块
-from .similarity import get_similarity_computer
+from .similarity import get_similarity_computer, list_available_algorithms
 
 
 def _valid_eval_id(value: Any) -> str | None:
@@ -177,6 +177,55 @@ def compute_token_similarity(data: DataProto) -> torch.Tensor:
     return get_similarity_computer("token_match").compute(data)
 
 
+def _to_plain_config(value: Any) -> Any:
+    """把 OmegaConf 配置转换成普通 Python 容器，便于传给各算法。"""
+
+    if hasattr(value, "items"):
+        return {key: _to_plain_config(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)) or type(value).__name__ == "ListConfig":
+        return [_to_plain_config(item) for item in value]
+    return value
+
+
+def _normalize_metric_algorithms(algorithms: Any) -> list[str]:
+    """规范化需要额外记录探索奖励指标的算法列表。"""
+
+    if algorithms is None:
+        return []
+    if isinstance(algorithms, str):
+        algorithms = algorithms.strip()
+        if algorithms.startswith("[") and algorithms.endswith("]"):
+            algorithms = algorithms[1:-1]
+        raw_algorithms = [item.strip().strip("\"'") for item in algorithms.split(",") if item.strip()]
+    else:
+        raw_algorithms = [str(item).strip() for item in algorithms if str(item).strip()]
+
+    normalized: list[str] = []
+    for algorithm in raw_algorithms:
+        if algorithm.lower() == "all":
+            normalized.extend(list_available_algorithms())
+        else:
+            normalized.append(algorithm)
+
+    deduped: list[str] = []
+    seen = set()
+    for algorithm in normalized:
+        if algorithm not in seen:
+            deduped.append(algorithm)
+            seen.add(algorithm)
+    return deduped
+
+
+def _compute_exploration_values(similarity_matrix: torch.Tensor) -> torch.Tensor:
+    """由相似度矩阵计算每条 response 的探索奖励标量。"""
+
+    similarity_sum = similarity_matrix.sum(-1)
+    exploration_values = torch.zeros_like(similarity_sum)
+    positive_mask = similarity_sum > 0
+    exploration_values[positive_mask] = similarity_sum[positive_mask].reciprocal()
+    return exploration_values
+
+
 class AERRewardManager:
     # add: 添加相似度算法参数支持
     def __init__(
@@ -184,7 +233,8 @@ class AERRewardManager:
         tokenizer,
         reward_fn_key="data_source",
         similarity_algorithm="token_match",
-        similarity_params=None
+        similarity_params=None,
+        exploration_metric_algorithms=None,
     ):
         """
         AER 奖励管理器，支持多种相似度计算算法
@@ -201,31 +251,46 @@ class AERRewardManager:
                 - "semantic_embedding": 语义嵌入相似度
                 - "simhash": SimHash 近重复相似度
             similarity_params: 算法特定参数字典
+            exploration_metric_algorithms: 额外记录探索奖励指标的算法列表；设为 ["all"] 时使用所有已注册算法
         """
         self.tokenizer = tokenizer
         self.reward_fn_key = reward_fn_key
         self.similarity_algorithm = similarity_algorithm
-        self.similarity_params = similarity_params or {}
+        self.similarity_params = _to_plain_config(similarity_params or {})
+        self.exploration_metric_algorithms = _normalize_metric_algorithms(exploration_metric_algorithms)
 
         # add: 创建相似度计算器
-        self.similarity_computer = get_similarity_computer(
-            similarity_algorithm,
-            **self.similarity_params
-        )
+        self.exploration_metric_computers = {
+            algorithm: get_similarity_computer(algorithm, **self.similarity_params)
+            for algorithm in self.exploration_metric_algorithms
+        }
+        if similarity_algorithm in self.exploration_metric_computers:
+            self.similarity_computer = self.exploration_metric_computers[similarity_algorithm]
+        else:
+            self.similarity_computer = get_similarity_computer(similarity_algorithm, **self.similarity_params)
 
 
     def __call__(self, data: DataProto, return_dict: bool = True, num_examine: int = 1) -> Union[torch.Tensor, Dict[str, Any]]:
         reward_tensor_acc = torch.zeros_like(data.batch["responses"], dtype=torch.float32)
         reward_tensor_exploration = torch.zeros_like(data.batch["responses"], dtype=torch.float32)
+        reward_tensors_exploration_by_algorithm = {
+            algorithm: torch.zeros_like(data.batch["responses"], dtype=torch.float32)
+            for algorithm in self.exploration_metric_computers
+        }
         reward_extra_info = defaultdict(list)
         already_print_data_sources = {}
 
-        # modify: 使用配置的相似度计算算法
-        # 原代码：similarity = compute_token_similarity(data)
-        # 新代码：支持多种相似度算法，通过 similarity_algorithm 参数选择
-        # add: 传递 tokenizer 以支持需要解码文本的算法（如 char_ngram, levenshtein, tfidf_cosine, semantic_embedding）
-        similarity = self.similarity_computer.compute(data, tokenizer=self.tokenizer)
-        similarity = similarity.sum(-1)
+        exploration_values_by_algorithm = {
+            algorithm: _compute_exploration_values(computer.compute(data, tokenizer=self.tokenizer))
+            for algorithm, computer in self.exploration_metric_computers.items()
+        }
+        if self.similarity_algorithm in exploration_values_by_algorithm:
+            exploration_values = exploration_values_by_algorithm[self.similarity_algorithm]
+        else:
+            exploration_values = _compute_exploration_values(
+                self.similarity_computer.compute(data, tokenizer=self.tokenizer)
+            )
+
         for i in range(len(data)):
             data_item = data[i]
             prompt_ids = data_item.batch["prompts"]
@@ -262,10 +327,12 @@ class AERRewardManager:
             else:
                 reward = score
                 
-            exploration_reward = 1.0/similarity[i].item() if (similarity[i].item() > 0) else 0.0
+            exploration_reward = exploration_values[i].item()
             
             reward_tensor_acc[i, valid_response_length - 1] = reward
             reward_tensor_exploration[i, valid_response_length - 1] = exploration_reward
+            for algorithm, algorithm_values in exploration_values_by_algorithm.items():
+                reward_tensors_exploration_by_algorithm[algorithm][i, valid_response_length - 1] = algorithm_values[i].item()
 
             if data_source not in already_print_data_sources:
                 already_print_data_sources[data_source] = 0
@@ -286,6 +353,7 @@ class AERRewardManager:
             return {
                 "reward_tensor_acc": reward_tensor_acc,
                 "reward_tensor_exploration": reward_tensor_exploration,
+                "reward_tensors_exploration_by_algorithm": reward_tensors_exploration_by_algorithm,
                 "reward_extra_info": reward_extra_info,
             }
         else:

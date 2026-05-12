@@ -1,13 +1,15 @@
-# 在 run.sh 开头添加，指定使用 GPU 4-7
-export CUDA_VISIBLE_DEVICES=4,5,6,7
+# 在 run.sh 开头添加，指定使用 GPU
+export CUDA_VISIBLE_DEVICES=0,1,2,3
 
 # 数据保存目录（必须先定义，因为后面的变量依赖它）
 save_dir="../../../save"
 
-# 该实验修改的超参数
+# 该实验运行 naive-GRPO baseline；tau=0 时探索奖励权重始终为 0，只把探索奖励作为指标记录。
 tau=0
 entropy_coeff=0.0
+# 训练兼容字段，tau=0 时不会影响实际 reward；探索奖励指标由 exploration_metric_algorithms 控制。
 similarity_algorithm="token_match"
+exploration_metric_algorithms="[token_match,ngram_overlap,char_ngram,levenshtein,tfidf_cosine,semantic_embedding,simhash,compression_ratio,rouge_l]"
 similarity_n=3
 resume_mode="auto" # auto;resume_path;disable
 resume_from_path=""
@@ -15,16 +17,17 @@ resume_from_path=""
 train_batch_size=128
 ppo_mini_batch_size=32
 # bs=128 后不能继续假设 300~400 step 收敛；先用 naive GRPO 做收敛扫描。
-total_training_steps=600
+total_training_steps=640
 # 每 24 step 保存一次，和 test_freq=12 配合，可保留每两个验证点一个可恢复 checkpoint。
 save_freq=24
-test_freq=12
-experiment_name="baseline-naive-offpolicy"
+test_freq=24
+experiment_name="baseline-naive-grpo-tau${tau}-all-similarity-metrics"
+# experiment_name="baseline-entropy_coeff${entropy_coeff}"
 max_actor_ckpt_to_keep=6
 max_critic_ckpt_to_keep=6
 
-# modify: 原来是1，改为到8
-val_kwargs_n=8
+# modify: 原来是1，改为到16
+val_kwargs_n=16
 
 
 # data
@@ -60,7 +63,7 @@ offload=False
 temperature=1.0
 top_p=1.0
 # modify: 原来是0.7，增加到0.9
-gpu_memory_utilization=0.9
+gpu_memory_utilization=0.85
 tensor_model_parallel_size=1
 rollout_n=16
 val_kwargs_temperature=0.6
@@ -76,7 +79,7 @@ reward_manager="aer"
 # tau=0.55
 
 # add: 相似度计算算法选择
-# 可选: token_match, ngram_overlap, char_ngram, levenshtein, tfidf_cosine, semantic_embedding, compression_ratio, rouge_l
+# 可选: token_match, ngram_overlap, char_ngram, levenshtein, tfidf_cosine, semantic_embedding, simhash, compression_ratio, rouge_l
 # - token_match: Token 精确匹配（原有方法，最快，~1ms）
 # - ngram_overlap: N-gram 重叠度（~5ms，推荐 n=3）
 # - char_ngram: 字符级 N-gram（~10ms，对数学符号鲁棒）
@@ -92,14 +95,15 @@ reward_manager="aer"
 # 可选: Qwen/Qwen3-Embedding-0.6B (默认，32K 长文本), Qwen/Qwen3-Embedding-4B, Qwen/Qwen3-Embedding-8B
 #      all-MiniLM-L6-v2 (最快，256 token 限制), all-mpnet-base-v2 (512 token 限制)
 similarity_model="/data/models/Qwen/Qwen3-Embedding-0.6B"
-# modify: 增大 batch_size 以充分利用CPU（原来是32）
-similarity_batch_size=128
-similarity_max_length=4096   # 匹配 max_response_length=$((1024 * 4))
-# add: 语义嵌入设备：cpu 或 cuda（推荐 cpu 避免与训练 GPU 竞争）
-similarity_device="cpu"
+# GPU 上 Qwen3-Embedding-0.6B 仍只编码 response 尾部 1024 token，控制显存和耗时。
+similarity_batch_size=16
+similarity_max_length=1024
+similarity_tail_tokens=1024
+# add: 语义嵌入使用训练外的物理 GPU。训练用 0,1,2,3，embedding worker 用 4,5,6,7。
+similarity_device="cuda"
+similarity_cuda_visible_devices="[4,5,6,7]"
 # add: 多进程并行数（用于 embedding 计算）
-# 服务器有 224 个逻辑核心，当前 221 个空闲
-# 设置 4 个进程，每个进程约 48 线程，总共约 192 线程
+# 4 个进程会按顺序分配到 similarity_cuda_visible_devices 中的 4 张 GPU。
 similarity_num_processes=4
 
 # algorithm
@@ -142,8 +146,7 @@ export RAY_TMPDIR=~/ray_tmp
 
 # add: 优化 CPU 线程数配置（用于 embedding 计算）
 # 服务器有 224 个逻辑核心（2×56核×2超线程）
-# 设置每个 embedding 进程使用约 48 线程，4 个进程共约 192 线程
-# 避免使用所有核心，留出一些给其他进程
+# 4 个 embedding 进程各 48 线程，约使用 192 个逻辑核，给 Ray/vLLM 留余量。
 export OMP_NUM_THREADS=48
 export MKL_NUM_THREADS=48
 export OPENBLAS_NUM_THREADS=48
@@ -196,11 +199,14 @@ nohup /data/ruanruihan/.conda/envs/aer/bin/python -m recipe.aer.src.main_ppo \
     algorithm.adv_estimator=${adv_estimator} \
     algorithm.tau=${tau} \
     algorithm.similarity_algorithm=${similarity_algorithm} \
+    algorithm.exploration_metric_algorithms="${exploration_metric_algorithms}" \
     algorithm.similarity_params.n=${similarity_n} \
     algorithm.similarity_params.model_name=${similarity_model} \
     algorithm.similarity_params.batch_size=${similarity_batch_size} \
     algorithm.similarity_params.max_length=${similarity_max_length} \
+    algorithm.similarity_params.tail_tokens=${similarity_tail_tokens} \
     algorithm.similarity_params.device=${similarity_device} \
+    algorithm.similarity_params.cuda_visible_devices="${similarity_cuda_visible_devices}" \
     algorithm.similarity_params.num_processes=${similarity_num_processes} \
     trainer.total_epochs=${total_epochs} \
     trainer.total_training_steps=${total_training_steps} \
@@ -214,4 +220,4 @@ nohup /data/ruanruihan/.conda/envs/aer/bin/python -m recipe.aer.src.main_ppo \
     trainer.test_freq="${test_freq}" \
     trainer.max_actor_ckpt_to_keep="${max_actor_ckpt_to_keep}" \
     trainer.max_critic_ckpt_to_keep="${max_critic_ckpt_to_keep}" \
-    trainer.default_local_dir="${default_local_dir}" > log.txt 2>&1 &
+    trainer.default_local_dir="${default_local_dir}" > baseline_naive_grpo_tau0_all_similarity_metrics_log.txt 2>&1 &

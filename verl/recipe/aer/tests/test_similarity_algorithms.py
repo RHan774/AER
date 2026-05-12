@@ -14,6 +14,7 @@ if "verl" not in sys.modules:
     sys.modules["verl"] = verl_stub
 
 from recipe.aer.src.similarity import get_similarity_computer, list_available_algorithms  # noqa: E402
+from recipe.aer.src.reward_manager import _normalize_metric_algorithms  # noqa: E402
 
 
 class FakeTokenizer:
@@ -167,6 +168,18 @@ class SimilarityAlgorithmTest(unittest.TestCase):
         computer = get_similarity_computer("semantic_embedding", model_name="all-MiniLM-L6-v2")
         self.assertEqual(computer.model_name, "all-MiniLM-L6-v2")
 
+    def test_semantic_embedding_accepts_dedicated_cuda_devices(self):
+        computer = get_similarity_computer(
+            "semantic_embedding",
+            model_name="unused",
+            device="cuda",
+            cuda_visible_devices="4,5,6,7",
+            num_processes=4,
+        )
+
+        self.assertEqual(computer.cuda_visible_devices, ["4", "5", "6", "7"])
+        self.assertEqual(computer.cuda_visible_devices_key, "4,5,6,7")
+
     def test_semantic_embedding_normalizes_to_closed_interval_and_keeps_groups_separate(self):
         tokenizer = FakeTokenizer({1: "same", 2: "opposite", 3: "cross"}, join_with_space=True)
         data = FakeDataProto([[1], [2], [3]], ["g1", "g1", "g2"])
@@ -218,6 +231,16 @@ class SimilarityAlgorithmTest(unittest.TestCase):
         self.assertIn("simhash", algorithms)
         self.assertIn("compression_ratio", algorithms)
         self.assertIn("rouge_l", algorithms)
+
+    def test_metric_algorithm_list_accepts_hydra_list_string(self):
+        algorithms = _normalize_metric_algorithms("[token_match,ngram_overlap,rouge_l]")
+
+        self.assertEqual(algorithms, ["token_match", "ngram_overlap", "rouge_l"])
+
+    def test_metric_algorithm_list_expands_all(self):
+        algorithms = _normalize_metric_algorithms(["all"])
+
+        self.assertEqual(algorithms, list_available_algorithms())
 
 
 if __name__ == "__main__":
