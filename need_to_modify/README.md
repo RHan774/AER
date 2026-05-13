@@ -134,6 +134,7 @@ FORMAL_EVAL_INCLUDE_GAMMA_SEARCH=0
 | `save/eval/<exp>/train_log/` | 训练日志导出的指标 |
 | `save/eval/<exp>/jsonl/<step>/` | 训练期间实时 CPU 评测（每步一个子目录） |
 | `save/eval/<exp>/<FORMAL_EVAL_OUTPUT_SUBDIR>/` | 正式完整评测 |
-| `save/run/logs/<exp>.log` | 每个训练实验 stdout/stderr |
+| `need_to_modify/train_log/<exp>.txt` | 每个训练实验 stdout/stderr |
+| `need_to_modify/eval_log/<exp>.txt` | 训练期间后台评测 watcher 日志 |
 
 中断后重新执行同一命令即可；已完成实验由 `save/run/state/<exp>.done` 跳过，未完成实验使用 `trainer.resume_mode=auto` 续跑。

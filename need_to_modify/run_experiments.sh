@@ -16,7 +16,8 @@ fi
 AER_DIR="${REPO_ROOT}/verl/recipe/aer"
 VERL_DIR="${REPO_ROOT}/verl"
 STATE_DIR="${SAVE_DIR}/run/state"
-LOG_DIR="${SAVE_DIR}/run/logs"
+LOG_DIR="${SAVE_DIR}/run/train_logs"
+EVAL_LOG_DIR="${SAVE_DIR}/run/eval_logs"
 EVAL_DIR="${SAVE_DIR}/eval"
 TMP_DIR="${SAVE_DIR}/tmp"
 
@@ -37,7 +38,7 @@ bool_is_true() {
 }
 
 prepare_dirs() {
-  mkdir -p "${SAVE_DIR}" "${STATE_DIR}" "${LOG_DIR}" "${EVAL_DIR}" "${TMP_DIR}"
+  mkdir -p "${SAVE_DIR}" "${STATE_DIR}" "${LOG_DIR}" "${EVAL_LOG_DIR}" "${EVAL_DIR}" "${TMP_DIR}"
   mkdir -p "${SAVE_DIR}/checkpoints" "${SAVE_DIR}/validation" "${SAVE_DIR}/data" "${SAVE_DIR}/models"
 }
 
@@ -360,6 +361,7 @@ start_eval_watcher() {
 
   local input_dir="${SAVE_DIR}/validation/${exp_name}"
   local output_dir="${EVAL_DIR}/${exp_name}/jsonl"
+  local eval_log_file="${EVAL_LOG_DIR}/${exp_name}.log"
   mkdir -p "${input_dir}" "${output_dir}"
 
   EVAL_WATCHER_STOP_FILE="${TMP_DIR}/.eval_watcher_stop_${exp_name}"
@@ -384,7 +386,7 @@ start_eval_watcher() {
           --semantic-model "${EMBEDDING_MODEL_PATH}" \
           --semantic-device "${AFTER_TRAIN_EVAL_SEMANTIC_DEVICE:-cpu}" \
           --semantic-batch-size "${AFTER_TRAIN_EVAL_SEMANTIC_BATCH_SIZE:-32}" \
-          --semantic-max-length "${AFTER_TRAIN_EVAL_SEMANTIC_MAX_LENGTH:-1024}" 2>/dev/null || true
+          --semantic-max-length "${AFTER_TRAIN_EVAL_SEMANTIC_MAX_LENGTH:-1024}" || true
       done
       sleep 30
     done
@@ -404,12 +406,12 @@ start_eval_watcher() {
         --semantic-model "${EMBEDDING_MODEL_PATH}" \
         --semantic-device "${AFTER_TRAIN_EVAL_SEMANTIC_DEVICE:-cpu}" \
         --semantic-batch-size "${AFTER_TRAIN_EVAL_SEMANTIC_BATCH_SIZE:-32}" \
-        --semantic-max-length "${AFTER_TRAIN_EVAL_SEMANTIC_MAX_LENGTH:-1024}" 2>/dev/null || true
+        --semantic-max-length "${AFTER_TRAIN_EVAL_SEMANTIC_MAX_LENGTH:-1024}" || true
     done
-  ) &
+  ) >> "${eval_log_file}" 2>&1 &
   EVAL_WATCHER_PID="$!"
   EVAL_BG_PIDS+=("${EVAL_WATCHER_PID}")
-  log "启动后台评测 watcher (PID=${EVAL_WATCHER_PID}): ${exp_name}"
+  log "启动后台评测 watcher (PID=${EVAL_WATCHER_PID}): ${exp_name}, 日志: ${eval_log_file}"
 }
 
 stop_eval_watcher() {
