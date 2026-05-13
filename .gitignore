@@ -10,6 +10,4 @@ verl/recipe/sppo/
 *.whl
 verl/recipe/aer/log.txt
 verl/recipe/aer/monitor_*
-need_to_modify/config.env
-need_to_modify_dist/
 master.log

@@ -142,6 +142,40 @@ tau_tag() {
   printf '%s' "$1" | sed 's/-/m/g; s/\./p/g'
 }
 
+gamma_tag() {
+  tau_tag "$1"
+}
+
+baseline_naive_exp_name() {
+  printf 'baseline-naive-calib-tau0-s%s' "${CALIBRATION_STEPS}"
+}
+
+baseline_entropy_exp_name() {
+  printf 'baseline-entropy-mean-tau0-s%s' "${TOTAL_TRAINING_STEPS}"
+}
+
+tau_plan_path() {
+  printf '%s/tau_plan_%s.csv' "${EVAL_DIR}" "$1"
+}
+
+gamma_best_env_path() {
+  printf '%s/gamma_best_%s.env' "${EVAL_DIR}" "${TARGET_SIMILARITY_FOR_GAMMA_SEARCH}"
+}
+
+gamma_search_exp_name() {
+  local algorithm="$1"
+  local gamma="$2"
+  local tau="$3"
+  printf 'gamma-search-%s-g%s-tau%s-s%s' "${algorithm}" "$(gamma_tag "${gamma}")" "$(tau_tag "${tau}")" "${TOTAL_TRAINING_STEPS}"
+}
+
+main_aer_exp_name() {
+  local algorithm="$1"
+  local gamma="$2"
+  local tau="$3"
+  printf 'aer-%s-g%s-tau%s-s%s' "${algorithm}" "$(gamma_tag "${gamma}")" "$(tau_tag "${tau}")" "${TOTAL_TRAINING_STEPS}"
+}
+
 read_tau_value() {
   local tau_csv="$1"
   local column="$2"
@@ -157,6 +191,42 @@ if value is None or value == "":
     raise SystemExit(f"{path} 缺少列 {column} 或该列为空")
 print(value)
 PY
+}
+
+read_tau_for_gamma() {
+  local algorithm="$1"
+  local gamma="$2"
+  local tau_csv
+  tau_csv="$(tau_plan_path "${algorithm}")"
+  python - "${tau_csv}" "${algorithm}" "${gamma}" <<'PY'
+import csv
+import math
+import sys
+
+path, algorithm, gamma = sys.argv[1:]
+target = float(gamma)
+with open(path, encoding="utf-8") as f:
+    for row in csv.DictReader(f):
+        if row.get("algorithm") == algorithm and math.isclose(float(row["gamma"]), target, rel_tol=0.0, abs_tol=1e-12):
+            print(row["tau"])
+            break
+    else:
+        raise SystemExit(f"{path} 中没有 algorithm={algorithm}, gamma={gamma}")
+PY
+}
+
+resolve_gamma_best() {
+  if [[ -n "${GAMMA_BEST:-}" && "${GAMMA_BEST}" != "auto" ]]; then
+    printf '%s' "${GAMMA_BEST}"
+    return 0
+  fi
+
+  local gamma_env
+  gamma_env="$(gamma_best_env_path)"
+  [[ -s "${gamma_env}" ]] || die "GAMMA_BEST=auto 但未找到 ${gamma_env}，请先运行训练脚本完成 gamma 搜索，或在 config.env 中手动设置 GAMMA_BEST。"
+  # shellcheck source=/dev/null
+  source "${gamma_env}"
+  printf '%s' "${GAMMA_BEST}"
 }
 
 run_logged() {
@@ -270,24 +340,53 @@ discover_formal_experiments_from_dirs() {
 collect_formal_experiments() {
   FORMAL_EXPS=()
 
+  local exp_name
+  for exp_name in ${FORMAL_EVAL_EXPERIMENT_NAMES:-}; do
+    add_experiment "${exp_name}"
+  done
+
+  if bool_is_true "${FORMAL_EVAL_INCLUDE_BASELINE_NAIVE:-1}"; then
+    add_experiment "$(baseline_naive_exp_name)"
+  fi
+  if bool_is_true "${FORMAL_EVAL_INCLUDE_BASELINE_ENTROPY:-1}"; then
+    add_experiment "$(baseline_entropy_exp_name)"
+  fi
+
+  local gamma_best=""
+  if [[ "${FORMAL_EVAL_INCLUDE_GAMMA_SEARCH:-best}" != "0" || -n "${FORMAL_EVAL_MAIN_ALGORITHMS:-}" ]]; then
+    gamma_best="$(resolve_gamma_best)"
+  fi
+
+  if [[ "${FORMAL_EVAL_INCLUDE_GAMMA_SEARCH:-best}" == "best" ]]; then
+    local tau
+    tau="$(read_tau_for_gamma "${TARGET_SIMILARITY_FOR_GAMMA_SEARCH}" "${gamma_best}")"
+    add_experiment "$(gamma_search_exp_name "${TARGET_SIMILARITY_FOR_GAMMA_SEARCH}" "${gamma_best}" "${tau}")"
+  elif [[ "${FORMAL_EVAL_INCLUDE_GAMMA_SEARCH:-best}" == "all" ]]; then
+    local gamma
+    for gamma in ${GAMMA_LIST}; do
+      local tau
+      tau="$(read_tau_for_gamma "${TARGET_SIMILARITY_FOR_GAMMA_SEARCH}" "${gamma}")"
+      add_experiment "$(gamma_search_exp_name "${TARGET_SIMILARITY_FOR_GAMMA_SEARCH}" "${gamma}" "${tau}")"
+    done
+  fi
+
   local algorithm
-  for algorithm in ${EXPERIMENT_ALGORITHMS}; do
-    local tau_csv="${EVAL_DIR}/tau_plan_${algorithm}.csv"
-    if generate_tau_plan_if_needed "${algorithm}"; then
-      local label
-      for label in low mid high; do
-        local tau
-        local tau_name
-        tau="$(read_tau_value "${tau_csv}" "tau_${label}")"
-        tau_name="$(tau_tag "${tau}")"
-        add_experiment "aer-${algorithm}-${label}-tau${tau_name}-s${TOTAL_TRAINING_STEPS}"
-      done
+  for algorithm in ${FORMAL_EVAL_MAIN_ALGORITHMS:-${MAIN_SIMILARITY_ALGORITHMS:-}}; do
+    local tau
+    tau="$(read_tau_for_gamma "${algorithm}" "${gamma_best}")"
+    if [[ "${algorithm}" == "${TARGET_SIMILARITY_FOR_GAMMA_SEARCH}" ]] && bool_is_true "${FORMAL_EVAL_REUSE_GAMMA_SEARCH_FOR_TARGET:-${REUSE_GAMMA_SEARCH_FOR_TARGET:-1}}"; then
+      add_experiment "$(gamma_search_exp_name "${algorithm}" "${gamma_best}" "${tau}")"
+    else
+      add_experiment "$(main_aer_exp_name "${algorithm}" "${gamma_best}" "${tau}")"
     fi
-    discover_formal_experiments_from_dirs "${algorithm}"
+  done
+
+  for exp_name in ${FORMAL_EVAL_EXTRA_EXPERIMENT_NAMES:-}; do
+    add_experiment "${exp_name}"
   done
 
   if [[ "${#FORMAL_EXPS[@]}" -eq 0 ]]; then
-    die "未找到任何 AER 正式实验。请检查 EXPERIMENT_ALGORITHMS、${EVAL_DIR}/tau_plan_*.csv 和 ${SAVE_DIR}/checkpoints/aer-*/"
+    die "未配置任何正式评测实验。请检查 FORMAL_EVAL_* 配置。"
   fi
 }
 
@@ -301,7 +400,12 @@ CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES}
 EVAL_GPUS=${EVAL_GPUS}
 EVAL_CHECKPOINT_STEP=${EVAL_CHECKPOINT_STEP}
 TOTAL_TRAINING_STEPS=${TOTAL_TRAINING_STEPS}
-EXPERIMENT_ALGORITHMS=${EXPERIMENT_ALGORITHMS}
+FORMAL_EVAL_INCLUDE_BASELINE_NAIVE=${FORMAL_EVAL_INCLUDE_BASELINE_NAIVE:-1}
+FORMAL_EVAL_INCLUDE_BASELINE_ENTROPY=${FORMAL_EVAL_INCLUDE_BASELINE_ENTROPY:-1}
+FORMAL_EVAL_INCLUDE_GAMMA_SEARCH=${FORMAL_EVAL_INCLUDE_GAMMA_SEARCH:-best}
+FORMAL_EVAL_MAIN_ALGORITHMS=${FORMAL_EVAL_MAIN_ALGORITHMS:-${MAIN_SIMILARITY_ALGORITHMS:-}}
+TARGET_SIMILARITY_FOR_GAMMA_SEARCH=${TARGET_SIMILARITY_FOR_GAMMA_SEARCH}
+GAMMA_BEST=${GAMMA_BEST}
 EVAL_RERUN_METRICS=${EVAL_RERUN_METRICS}
 EVAL_RERUN_KS=${EVAL_RERUN_KS}
 EVAL_SAMPLES_PER_PROMPT=${EVAL_SAMPLES_PER_PROMPT}
@@ -348,8 +452,8 @@ PY
     [[ -f "${file}" ]] || missing+=("缺少验证数据: ${file}")
   done
 
-  if [[ "${#GPU_IDS[@]}" -ne 4 ]]; then
-    missing+=("本脚本要求 4 张 GPU 分片运行，但 EVAL_GPUS/CUDA_VISIBLE_DEVICES 解析得到 ${#GPU_IDS[@]} 张: ${EVAL_GPUS}")
+  if [[ "${#GPU_IDS[@]}" -lt 1 ]]; then
+    missing+=("至少需要 1 张 GPU 做正式模型推理，但 EVAL_GPUS 为空")
   fi
 
   if metric_list_contains "${EVAL_RERUN_METRICS}" "semantic-cosine"; then
@@ -361,8 +465,8 @@ PY
     if ! python -c "import sentence_transformers" >/dev/null 2>&1; then
       missing+=("评估包含 semantic-cosine，但当前 conda 环境缺少 sentence-transformers")
     fi
-    if [[ "$(tr ',' '\n' <<< "${EVAL_SEMANTIC_DEVICE}" | sed '/^[[:space:]]*$/d' | wc -l)" -ne 4 ]]; then
-      missing+=("semantic-cosine 需要使用 4 张 GPU，但 EVAL_SEMANTIC_DEVICE=${EVAL_SEMANTIC_DEVICE}")
+    if [[ -z "${EVAL_SEMANTIC_DEVICE:-}" ]]; then
+      missing+=("评估包含 semantic-cosine，但 EVAL_SEMANTIC_DEVICE 为空")
     fi
   fi
 
@@ -560,34 +664,29 @@ run_one_experiment() {
 main() {
   apply_runtime_env
 
-  EVAL_CHECKPOINT_STEP="${EVAL_CHECKPOINT_STEP:-240}"
-  EVAL_GPUS="${EVAL_GPUS:-${CUDA_VISIBLE_DEVICES}}"
+  EVAL_CHECKPOINT_STEP="${FORMAL_EVAL_CHECKPOINT_STEP:-${EVAL_CHECKPOINT_STEP:-${TOTAL_TRAINING_STEPS:-640}}}"
+  EVAL_GPUS="${FORMAL_EVAL_GPUS:-${EVAL_GPUS:-${CUDA_VISIBLE_DEVICES}}}"
   split_csv "${EVAL_GPUS}" GPU_IDS
 
-  EVAL_RERUN_METRICS="${EVAL_RERUN_METRICS:-${EVAL_MODEL_METRICS:-${EVAL_METRICS:-pass@k,first@1,distinct-2,self-bleu,semantic-cosine}}}"
-  if bool_is_true "${EVAL_INCLUDE_SEMANTIC_COSINE:-1}"; then
-    EVAL_RERUN_METRICS="$(append_metric_if_missing "${EVAL_RERUN_METRICS}" "semantic-cosine")"
-  fi
-  if bool_is_true "${EVAL_INCLUDE_EQUATIONAL_DIVERSITY:-1}"; then
-    EVAL_RERUN_METRICS="$(append_metric_if_missing "${EVAL_RERUN_METRICS}" "equational-diversity")"
-  fi
-  EVAL_RERUN_KS="${EVAL_RERUN_KS:-${EVAL_MODEL_KS:-${EVAL_KS:-1,2,4,8,16,32,64,128}}}"
-  EVAL_SAMPLES_PER_PROMPT="${EVAL_SAMPLES_PER_PROMPT:-128}"
-  EVAL_OUTPUT_SUBDIR="${EVAL_OUTPUT_SUBDIR:-rerun_pass${EVAL_SAMPLES_PER_PROMPT}_sharded}"
-  EVAL_SEMANTIC_DEVICE="${EVAL_SEMANTIC_DEVICE:-$(logical_cuda_devices "${#GPU_IDS[@]}")}"
-  EVAL_SEMANTIC_BATCH_SIZE="${EVAL_SEMANTIC_BATCH_SIZE:-${SEMANTIC_BATCH_SIZE:-128}}"
-  EVAL_SEMANTIC_MAX_LENGTH="${EVAL_SEMANTIC_MAX_LENGTH:-${SIMILARITY_MAX_LENGTH:-4096}}"
-  EVAL_ROLLOUT_SAVE_BATCH_SIZE="${EVAL_ROLLOUT_SAVE_BATCH_SIZE:-8}"
-  EVAL_BACKEND="${EVAL_BACKEND:-vllm}"
-  EVAL_GPU_MEMORY_UTILIZATION="${EVAL_GPU_MEMORY_UTILIZATION:-${GPU_MEMORY_UTILIZATION:-0.9}}"
-  EVAL_VLLM_MAX_MODEL_LEN="${EVAL_VLLM_MAX_MODEL_LEN:-$((${MAX_PROMPT_LENGTH:-2048} + ${MAX_RESPONSE_LENGTH:-4096}))}"
-  EVAL_VLLM_MAX_NUM_SEQS="${EVAL_VLLM_MAX_NUM_SEQS:-256}"
-  EVAL_VLLM_MAX_NUM_BATCHED_TOKENS="${EVAL_VLLM_MAX_NUM_BATCHED_TOKENS:-65536}"
-  EVAL_MAX_NEW_TOKENS="${EVAL_MAX_NEW_TOKENS:-${MAX_RESPONSE_LENGTH:-4096}}"
-  EVAL_TEMPERATURE="${EVAL_TEMPERATURE:-${VAL_KWARGS_TEMPERATURE:-0.6}}"
-  EVAL_TOP_P="${EVAL_TOP_P:-${VAL_KWARGS_TOP_P:-0.95}}"
-  EVAL_TOP_K="${EVAL_TOP_K:-${VAL_KWARGS_TOP_K:-20}}"
-  EVAL_SEED="${EVAL_SEED:-42}"
+  EVAL_RERUN_METRICS="${FORMAL_EVAL_METRICS:-${EVAL_RERUN_METRICS:-pass@k,first@1,distinct-2,self-bleu,semantic-cosine,equational-diversity}}"
+  EVAL_RERUN_KS="${FORMAL_EVAL_KS:-${EVAL_RERUN_KS:-1,2,4,8,16,32,64,128}}"
+  EVAL_SAMPLES_PER_PROMPT="${FORMAL_EVAL_SAMPLES_PER_PROMPT:-${EVAL_SAMPLES_PER_PROMPT:-128}}"
+  EVAL_OUTPUT_SUBDIR="${FORMAL_EVAL_OUTPUT_SUBDIR:-${EVAL_OUTPUT_SUBDIR:-formal_pass${EVAL_SAMPLES_PER_PROMPT}_sharded}}"
+  EVAL_SEMANTIC_DEVICE="${FORMAL_EVAL_SEMANTIC_DEVICE:-${EVAL_SEMANTIC_DEVICE:-$(logical_cuda_devices "${#GPU_IDS[@]}")}}"
+  EVAL_SEMANTIC_BATCH_SIZE="${FORMAL_EVAL_SEMANTIC_BATCH_SIZE:-${EVAL_SEMANTIC_BATCH_SIZE:-128}}"
+  EVAL_SEMANTIC_MAX_LENGTH="${FORMAL_EVAL_SEMANTIC_MAX_LENGTH:-${EVAL_SEMANTIC_MAX_LENGTH:-4096}}"
+  EVAL_ROLLOUT_SAVE_BATCH_SIZE="${FORMAL_EVAL_ROLLOUT_SAVE_BATCH_SIZE:-${EVAL_ROLLOUT_SAVE_BATCH_SIZE:-8}}"
+  EVAL_BACKEND="${FORMAL_EVAL_BACKEND:-${EVAL_BACKEND:-vllm}}"
+  EVAL_GPU_MEMORY_UTILIZATION="${FORMAL_EVAL_GPU_MEMORY_UTILIZATION:-${EVAL_GPU_MEMORY_UTILIZATION:-${GPU_MEMORY_UTILIZATION:-0.9}}}"
+  EVAL_VLLM_MAX_MODEL_LEN="${FORMAL_EVAL_VLLM_MAX_MODEL_LEN:-${EVAL_VLLM_MAX_MODEL_LEN:-$((${MAX_PROMPT_LENGTH:-2048} + ${MAX_RESPONSE_LENGTH:-4096}))}}"
+  EVAL_VLLM_MAX_NUM_SEQS="${FORMAL_EVAL_VLLM_MAX_NUM_SEQS:-${EVAL_VLLM_MAX_NUM_SEQS:-256}}"
+  EVAL_VLLM_MAX_NUM_BATCHED_TOKENS="${FORMAL_EVAL_VLLM_MAX_NUM_BATCHED_TOKENS:-${EVAL_VLLM_MAX_NUM_BATCHED_TOKENS:-65536}}"
+  EVAL_MAX_NEW_TOKENS="${FORMAL_EVAL_MAX_NEW_TOKENS:-${EVAL_MAX_NEW_TOKENS:-${MAX_RESPONSE_LENGTH:-4096}}}"
+  EVAL_TEMPERATURE="${FORMAL_EVAL_TEMPERATURE:-${EVAL_TEMPERATURE:-${VAL_KWARGS_TEMPERATURE:-0.6}}}"
+  EVAL_TOP_P="${FORMAL_EVAL_TOP_P:-${EVAL_TOP_P:-${VAL_KWARGS_TOP_P:-0.95}}}"
+  EVAL_TOP_K="${FORMAL_EVAL_TOP_K:-${EVAL_TOP_K:-${VAL_KWARGS_TOP_K:-20}}}"
+  EVAL_SEED="${FORMAL_EVAL_SEED:-${EVAL_SEED:-42}}"
+  EVAL_FORCE_MERGE="${FORMAL_EVAL_FORCE_MERGE:-${EVAL_FORCE_MERGE:-0}}"
 
   VAL_FILES=(
     "${SAVE_DIR}/data/math-ai/math500/test_repeated.parquet"
@@ -615,7 +714,7 @@ main() {
     run_one_experiment "${exp_name}"
   done
 
-  log "所有 AER 正式实验第 ${EVAL_CHECKPOINT_STEP} 步 checkpoint 的重推理评估已完成。主日志: ${MASTER_LOG}"
+  log "所有正式实验第 ${EVAL_CHECKPOINT_STEP} 步 checkpoint 的重推理评估已完成。主日志: ${MASTER_LOG}"
 }
 
 main "$@"

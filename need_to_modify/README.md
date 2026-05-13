@@ -1,137 +1,139 @@
-# AER 服务器运行说明
+# AER 新实验运行说明
 
-这个目录用于把 AER 项目交给在 4 张 GPU 服务器上跑固定实验队列。默认只需要改一个配置文件，然后执行一个脚本。
+这个目录用于一键配置环境、运行新实验计划，并对训练好的 checkpoint 做正式完整评测。默认训练超参对齐 `verl/recipe/aer/run.sh`，实验队列改为 T0/T1/gamma-search/main AER。
 
-## 1. 需要做的最少操作
+## 1. 最少操作
 
-> 如果服务器上未激活conda环境，需要先激活：
-> ```bash
-> conda init
-> source ~/.bashrc
-> ```
+先检查并修改 `need_to_modify/config.env`：
 
 ```bash
-## 检查当前配置，如果有需要修改的，需要修改`need_to_modify/config.env`
 bash need_to_modify/run_experiments.sh status
 ```
 
-至少检查：
+重点确认：
 
 ```bash
-REPO_ROOT= # 当前项目的路径
-SAVE_DIR= # 数据（数据集、模型、checkpoints、测试时生成的响应等）保存路径
-CONFIG_FILE= # 应指向 AER/need_to_modify/config.env
-CUDA_VISIBLE_DEVICES=0,1,2,3 # ！重要！使用GPU序号
-# EXPERIMENT_ALGORITHMS=ngram_overlap simhash levenshtein semantic_embedding
-# CALIBRATION_STEPS=72
-# TOTAL_TRAINING_STEPS=240
-# WANDB_MODE=online
-# WANDB_PROJECT=AER
-MODEL_PATH= # 模型下载路径，默认在${SAVE_DIR}下
+WANDB_API_KEY=""
+MODEL_PATH="/data/models/Qwen/Qwen3-4B"
+EMBEDDING_MODEL_PATH="/data/models/Qwen/Qwen3-Embedding-0.6B"
+CUDA_VISIBLE_DEVICES="0,1,2,3"
+SIMILARITY_DEVICE="cuda"
+SIMILARITY_CUDA_VISIBLE_DEVICES="[4,5,6,7]"
+SIMILARITY_NUM_PROCESSES=4
 ```
 
-如果模型和数据想放到其它磁盘，只改：
-
-```bash
-SAVE_DIR="/path/to/large_disk/aer_save"
-```
-
-然后运行：
+一键配置环境、下载模型和数据、跑测试、跑全部训练实验：
 
 ```bash
 nohup bash need_to_modify/run_experiments.sh all > master.log 2>&1 &
 tail -f master.log
 ```
 
-脚本会按顺序完成：创建/复用 conda 环境、安装本地代码、配置镜像和 wandb、下载模型、准备 parquet 数据、跑轻量测试、跑实验队列、导出训练日志和 validation JSONL 评测结果。
-
-## 2. 默认实验队列
-
-服务器默认跑：
-
-1. `ngram_overlap`：72 step 校准，自动生成 `tau_low/tau_mid/tau_high`，再跑三档正式实验。
-2. `simhash`：72 step 校准，自动生成 `tau_low/tau_mid/tau_high`，再跑三档正式实验。
-3. `levenshtein`：72 step 校准，自动生成 `tau_low/tau_mid/tau_high`，再跑三档正式实验。
-4. `semantic_embedding`：使用本地 `Qwen3-Embedding-0.6B` 在训练阶段计算探索奖励，72 step 校准后跑三档正式实验。
-
-对应配置：
+## 2. 常用命令
 
 ```bash
-EXPERIMENT_ALGORITHMS="ngram_overlap simhash levenshtein semantic_embedding"
-CALIBRATION_STEPS=72
-TOTAL_TRAINING_STEPS=240
-```
-
-如果主 baseline 的最终比较步数可能是 320，启动前把 `TOTAL_TRAINING_STEPS=320`。
-
-## 3. 常用命令
-
-只查看配置：
-
-```bash
-bash need_to_modify/run_experiments.sh status
-```
-
-只搭环境：
-
-```bash
+# 只安装环境
 bash need_to_modify/run_experiments.sh setup
-```
-
-只下载模型和准备数据：
-
-```bash
+# 只下载模型和数据
 bash need_to_modify/run_experiments.sh assets
-```
-
-只跑轻量测试：
-
-```bash
+# 只跑轻量测试（确认环境没问题）
 bash need_to_modify/run_experiments.sh test
-```
-
-只跑训练队列：
-
-```bash
+# **常用**：只运行实验
 bash need_to_modify/run_experiments.sh train
 ```
 
-## 4. 输出位置
+## 2. 训练队列
 
-默认都在 `${SAVE_DIR}` 下：
+默认队列：
+
+1. `baseline-naive-calib-tau0-s504`：tau=0，只记录 `CALIBRATION_METRIC_ALGORITHMS` 的探索奖励。
+2. `baseline-entropy-mean-tau0-s504`：熵正则 mean baseline。
+3. `gamma-search-ngram_overlap-g{gamma}-tau{tau}-s504`：默认搜索 `1.1 1.2 1.3 1.4`。
+4. `aer-token_match-g{best}-tau{tau}-s504`、`aer-ngram_overlap...`、`aer-semantic_embedding...`：主 AER 实验。
+
+在 `config.env` 中控制具体运行哪些实验：
+
+```bash
+RUN_BASELINE_NAIVE=1
+RUN_BASELINE_ENTROPY=1
+RUN_GAMMA_SEARCH=1
+RUN_MAIN_AER=1
+CALIBRATION_METRIC_ALGORITHMS="token_match ngram_overlap semantic_embedding"
+TARGET_SIMILARITY_FOR_GAMMA_SEARCH="ngram_overlap"
+GAMMA_LIST="1.1 1.2 1.3 1.4"
+GAMMA_BEST="auto"
+MAIN_SIMILARITY_ALGORITHMS="token_match ngram_overlap semantic_embedding"
+```
+
+`GAMMA_BEST=auto` 时，脚本会在 gamma 搜索全部跑完并完成训练后 CPU 评测后，写出 `save/eval/gamma_best_<algorithm>.env`。如果已经人工选好 gamma，可直接设置 `GAMMA_BEST="1.2"`。
+
+## 4. semantic_embedding 设备
+
+训练阶段 `semantic_embedding` 支持 CPU、单 GPU 或多 GPU：
+
+```bash
+# CPU
+SIMILARITY_DEVICE="cpu"
+SIMILARITY_CUDA_VISIBLE_DEVICES=""
+SIMILARITY_NUM_PROCESSES=4
+
+# 单 GPU
+SIMILARITY_DEVICE="cuda"
+SIMILARITY_CUDA_VISIBLE_DEVICES="[4]"
+SIMILARITY_NUM_PROCESSES=1
+
+# 多 GPU
+SIMILARITY_DEVICE="cuda"
+SIMILARITY_CUDA_VISIBLE_DEVICES="[4,5,6,7]"
+SIMILARITY_NUM_PROCESSES=4
+```
+
+训练期间后台 watcher 实时评测每一步 validation JSONL（纯 CPU，与训练并行不占 GPU）：
+
+```bash
+AFTER_TRAIN_EVAL_METRICS="pass@k,first@1,distinct-2,self-bleu,equational-diversity"
+AFTER_TRAIN_EVAL_KS="1,2,4,8"
+AFTER_TRAIN_EVAL_SEMANTIC_DEVICE="cpu"
+```
+
+## 5. 正式完整评测
+
+正式评测使用独立的 `FORMAL_EVAL_*` 配置，不和训练后轻量评测共用同一组指标。
+
+```bash
+nohup bash need_to_modify/run_eval_formal_checkpoints.sh > formal_eval.log 2>&1 &
+tail -f formal_eval.log
+```
+
+默认评测 naive baseline、entropy baseline、最佳 gamma-search run，以及 `FORMAL_EVAL_MAIN_ALGORITHMS` 对应的主 AER 实验。常用配置：
+
+```bash
+FORMAL_EVAL_METRICS="pass@k,first@1,distinct-2,self-bleu,semantic-cosine,equational-diversity"
+FORMAL_EVAL_KS="1,2,4,8,16,32,64,128"
+FORMAL_EVAL_SAMPLES_PER_PROMPT=128
+FORMAL_EVAL_GPUS="0,1,2,3"
+FORMAL_EVAL_CHECKPOINT_STEP="${TOTAL_TRAINING_STEPS}"  # 默认 504
+```
+
+也可以手动指定实验名：
+
+```bash
+FORMAL_EVAL_EXPERIMENT_NAMES="baseline-naive-calib-tau0-s504 aer-token_match-g1p2-tau0p123456-s504"
+FORMAL_EVAL_MAIN_ALGORITHMS=""
+FORMAL_EVAL_INCLUDE_GAMMA_SEARCH=0
+```
+
+## 6. 输出位置
 
 | 路径 | 内容 |
 |---|---|
-| `save/models/` | Qwen policy 模型和 semantic-cosine 评测用 embedding 模型 |
-| `save/data/` | 训练/验证 parquet |
 | `save/checkpoints/<exp>/` | FSDP checkpoint |
 | `save/validation/<exp>/` | 训练中保存的 validation JSONL |
-| `save/eval/<exp>/train_log/` | 从训练日志导出的曲线 CSV/JSON |
-| `save/eval/<exp>/jsonl/` | 从 validation JSONL 计算的 Pass@K、多样性指标 |
-| `save/run/logs/<exp>.log` | 每个实验的完整 stdout/stderr |
+| `save/eval/tau_plan_<algorithm>.csv` | 由 T0 最小探索奖励生成的 tau 表 |
+| `save/eval/gamma_best_<algorithm>.env` | 自动选择出的最佳 gamma |
+| `save/eval/<exp>/train_log/` | 训练日志导出的指标 |
+| `save/eval/<exp>/jsonl/<step>/` | 训练期间实时 CPU 评测（每步一个子目录） |
+| `save/eval/<exp>/<FORMAL_EVAL_OUTPUT_SUBDIR>/` | 正式完整评测 |
+| `save/run/logs/<exp>.log` | 每个训练实验 stdout/stderr |
 
-wandb run name 与本地 `<exp>` 一致。
-
-## 5. 出错后续跑
-
-脚本每个实验结束后会写 marker：
-
-```bash
-save/run/state/<exp>.done
-```
-
-如果中途断掉，重新执行同一个命令即可。未完成实验会用 `trainer.resume_mode=auto` 从已有 checkpoint 继续，已完成实验会跳过。
-
-如果确实要重跑全部实验：
-
-```bash
-FORCE_RERUN=1 bash need_to_modify/run_experiments.sh train
-```
-
-## 6. 注意
-
-默认 `STOP_RAY_BETWEEN_RUNS=1`，脚本会在每个实验前后执行 `ray stop --force`，避免 Ray 旧进程影响下一轮训练。服务器如果还跑着别人的 Ray 任务，需要先把该项改成 `0`。
-
-Ray 的临时目录默认使用 `RAY_TMPDIR=${HOME}/rt`，放在用户目录下且路径足够短。不要把它设成很长的项目路径，否则 Ray 的 Unix socket 路径可能超过系统限制并在启动时报 `AF_UNIX path length cannot exceed 107 bytes`。
-
-默认会跑训练阶段的 `semantic_embedding` 相似度算法，并在 assets 阶段下载 embedding 模型。它比 `ngram_overlap`、`simhash`、`levenshtein` 更吃 CPU/内存；如果该服务器资源不足，可以从 `EXPERIMENT_ALGORITHMS` 中临时移除 `semantic_embedding`，但保留 `DOWNLOAD_EMBEDDING_MODEL=1` 仍可用于训练结束后的 `semantic-cosine` 离线评测。
+中断后重新执行同一命令即可；已完成实验由 `save/run/state/<exp>.done` 跳过，未完成实验使用 `trainer.resume_mode=auto` 续跑。

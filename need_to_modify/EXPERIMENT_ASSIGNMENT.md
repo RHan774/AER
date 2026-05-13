@@ -1,41 +1,48 @@
 # 实验分工
 
-## 该服务器默认负责
+## 默认负责内容
 
-该服务器适合跑中途不需要人工判断的固定队列。默认队列已经写入 `config.example.env`：
+该目录现在按 `新实验计划.md` 组织完整队列，默认写入 `need_to_modify/config.env`：
 
-| 类型 | 实验 | 原因 |
+| 阶段 | 默认实验 | 配置项 |
 |---|---|---|
-| AER 校准 | `ngram_overlap`、`simhash`、`levenshtein`、`semantic_embedding` 的 `tau=0` 校准 | 每个算法先跑 72 step，脚本可自动从 `metric/exploration reward` 生成 tau |
-| AER 正式实验 | `ngram_overlap` 的 `tau_low/tau_mid/tau_high` | 轻量、无需额外模型、能检验 token n-gram 探索奖励 |
-| AER 正式实验 | `simhash` 的 `tau_low/tau_mid/tau_high` | 轻量、低内存、适合长输出近重复惩罚 |
-| AER 正式实验 | `levenshtein` 的 `tau_low/tau_mid/tau_high` | 编辑距离定义清晰，可作为字符级相似度对照 |
-| AER 校准与正式实验 | `semantic_embedding` 的 `tau_low/tau_mid/tau_high` | 使用 embedding 模型直接度量语义相似度，作为语义探索奖励主对照 |
+| T0 tau 校准 | `baseline-naive-calib-tau0-s504`，同时记录 `token_match`、`ngram_overlap`、`semantic_embedding` 探索奖励 | `RUN_BASELINE_NAIVE=1`、`CALIBRATION_METRIC_ALGORITHMS=...` |
+| T1 熵 baseline | `baseline-entropy-mean-tau0-s504` | `RUN_BASELINE_ENTROPY=1`、`ENTROPY_BASELINE_COEFF=5e-4` |
+| T2-T5 gamma 搜索 | `gamma-search-ngram_overlap-g{gamma}-tau{tau}-s504` | `RUN_GAMMA_SEARCH=1`、`GAMMA_LIST="1.1 1.2 1.3 1.4"` |
+| T6-T8 主 AER | `token_match`、`ngram_overlap`、`semantic_embedding` 复用 `gamma_best` | `RUN_MAIN_AER=1`、`MAIN_SIMILARITY_ALGORITHMS=...` |
+| 完整评测 | baseline、最佳 gamma-search、主 AER checkpoint 的 Pass@K 与多样性指标 | `run_eval_formal_checkpoints.sh`、`FORMAL_EVAL_*` |
 
-默认每个正式实验训练到 `TOTAL_TRAINING_STEPS=240`，每 12 step 验证一次，每 24 step 保存一次。若你这边 naive GRPO 还没有确定最终 `S_final`，启动前可以把 `TOTAL_TRAINING_STEPS` 改成 `320`，后续统一从 wandb/validation/checkpoint 里选同一个 step 比较。
+默认训练到 `504` step，每 36 step 验证和保存一次，对齐当前 `verl/recipe/aer/run.sh`。
 
-## 原服务器继续负责
+## 需要人工确认
 
-| 类型 | 实验 | 原因 |
-|---|---|---|
-| naive GRPO | 当前正在跑的 naive 扫描/正式 baseline | 决定统一 `S_final`，需要根据收敛情况判断 |
-| entropy baseline | 当前另一台服务器上的熵正则 baseline | 你能更方便地根据 collapse、长度、Pass@K 判断是否调整系数 |
-| 二阶段调参 | 根据前面结果追加 tau 或改训练步数 | 需要看 wandb 后人工决策 |
-| 重型/敏感算法 | `semantic_embedding`、必要时 `levenshtein` | 可能受 CPU、内存、embedding 模型下载与速度影响，更适合可随时调整的机器 |
+| 项目 | 说明 |
+|---|---|
+| `WANDB_API_KEY` | 不应提交到 Git，本地填写或把 `WANDB_MODE` 改成 `offline/disabled` |
+| `MODEL_PATH` | 默认 `/data/models/Qwen/Qwen3-4B`，按服务器实际路径修改 |
+| `EMBEDDING_MODEL_PATH` | semantic embedding 训练和 semantic-cosine 评测需要 |
+| `SIMILARITY_*` | 控制 semantic_embedding 使用 CPU、单 GPU 或多 GPU |
+| `CALIBRATION_DELAYED_ALGORITHMS` | 默认 `semantic_embedding`，T0 中延后到最后 10% 步才记录的耗时算法 |
+| `GAMMA_BEST` | 默认 `auto`，也可根据 gamma 搜索评测结果人工指定 |
 
 ## 可选扩展
 
-如果该服务器时间充足，可以在 `config.env` 中调整：
+增加补充算法时，先把算法加入校准列表，保证能从同一次 T0 baseline 取到 `min_exploration_reward`：
 
 ```bash
-EXPERIMENT_ALGORITHMS="ngram_overlap simhash token_match levenshtein semantic_embedding"
-TOTAL_TRAINING_STEPS=320
+CALIBRATION_METRIC_ALGORITHMS="token_match ngram_overlap semantic_embedding simhash"
+RUN_EXTRA_AER=1
+EXTRA_SIMILARITY_ALGORITHMS="simhash"
 ```
 
-如果你希望该服务器补齐熵正则系数网格，可填写：
+如果只想评测已有 checkpoint，不跑默认自动收集的实验，可在 `config.env` 中手动指定：
 
 ```bash
-ENTROPY_BASELINE_COEFFS="5e-4 2e-3"
+FORMAL_EVAL_EXPERIMENT_NAMES="baseline-naive-calib-tau0-s504 aer-token_match-g1p2-tau0p123456-s504"
+FORMAL_EVAL_INCLUDE_BASELINE_NAIVE=0
+FORMAL_EVAL_INCLUDE_BASELINE_ENTROPY=0
+FORMAL_EVAL_INCLUDE_GAMMA_SEARCH=0
+FORMAL_EVAL_MAIN_ALGORITHMS=""
 ```
 
-不要同时开启太多扩展。每个训练都会占满 4 张 GPU，脚本默认顺序执行。
+每个训练实验仍会占满 `N_GPUS_PER_NODE` 张训练 GPU，脚本默认顺序执行；semantic embedding 的额外设备由 `SIMILARITY_CUDA_VISIBLE_DEVICES` 单独控制。

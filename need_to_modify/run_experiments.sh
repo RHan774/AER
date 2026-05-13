@@ -4,15 +4,13 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 CONFIG_FILE="${AER_CONFIG:-${SCRIPT_DIR}/config.env}"
-EXAMPLE_CONFIG="${SCRIPT_DIR}/config.example.env"
 
 if [[ -f "${CONFIG_FILE}" ]]; then
   # shellcheck source=/dev/null
   source "${CONFIG_FILE}"
 else
-  echo "[WARN] 未找到 ${CONFIG_FILE}，临时使用示例配置。正式运行请先复制并填写 config.env。"
-  # shellcheck source=/dev/null
-  source "${EXAMPLE_CONFIG}"
+  printf '[ERROR] 未找到配置文件: %s\n' "${CONFIG_FILE}" >&2
+  exit 1
 fi
 
 AER_DIR="${REPO_ROOT}/verl/recipe/aer"
@@ -141,13 +139,14 @@ install_optional_deps_if_needed() {
   bool_is_true "${INSTALL_OPTIONAL_DEPS}" || return 0
 
   local deps=("scikit-learn==1.7.2")
-  case " ${EXPERIMENT_ALGORITHMS} " in
+  local configured_algorithms=" ${BASELINE_SIMILARITY_ALGORITHM:-} ${CALIBRATION_METRIC_ALGORITHMS:-} ${TARGET_SIMILARITY_FOR_GAMMA_SEARCH:-} ${MAIN_SIMILARITY_ALGORITHMS:-} ${EXTRA_SIMILARITY_ALGORITHMS:-} "
+  case "${configured_algorithms}" in
     *" levenshtein "*) deps+=("rapidfuzz") ;;
   esac
-  case " ${EXPERIMENT_ALGORITHMS} " in
+  case "${configured_algorithms}" in
     *" tfidf_cosine "*) ;;
   esac
-  if [[ " ${EXPERIMENT_ALGORITHMS} " == *" semantic_embedding "* ]] || [[ " ${EVAL_METRICS:-}" == *"semantic-cosine"* ]]; then
+  if [[ "${configured_algorithms}" == *" semantic_embedding "* ]] || [[ " ${AFTER_TRAIN_EVAL_METRICS:-} ${FORMAL_EVAL_METRICS:-} " == *"semantic-cosine"* ]]; then
     deps+=("sentence-transformers")
   fi
 
@@ -204,7 +203,8 @@ download_models() {
 
   hf_download "${POLICY_MODEL_REPO}" "${POLICY_MODEL_REVISION}" "${MODEL_PATH}" "model"
 
-  if bool_is_true "${DOWNLOAD_EMBEDDING_MODEL:-0}" || [[ " ${EXPERIMENT_ALGORITHMS} " == *" semantic_embedding "* ]] || [[ " ${EVAL_METRICS:-}" == *"semantic-cosine"* ]]; then
+  local configured_algorithms=" ${CALIBRATION_METRIC_ALGORITHMS:-} ${TARGET_SIMILARITY_FOR_GAMMA_SEARCH:-} ${MAIN_SIMILARITY_ALGORITHMS:-} ${EXTRA_SIMILARITY_ALGORITHMS:-} "
+  if bool_is_true "${DOWNLOAD_EMBEDDING_MODEL:-0}" || [[ "${configured_algorithms}" == *" semantic_embedding "* ]] || [[ " ${AFTER_TRAIN_EVAL_METRICS:-} ${FORMAL_EVAL_METRICS:-} " == *"semantic-cosine"* ]]; then
     hf_download "${EMBEDDING_MODEL_REPO}" "${EMBEDDING_MODEL_REVISION}" "${EMBEDDING_MODEL_PATH}" "model"
   fi
 }
@@ -259,6 +259,33 @@ stop_ray_if_needed() {
   fi
 }
 
+first_word() {
+  local item
+  for item in $1; do
+    printf '%s' "${item}"
+    return 0
+  done
+}
+
+hydra_list_from_string() {
+  local raw="${1:-}"
+  local result="["
+  local sep=""
+  local item
+  for item in ${raw}; do
+    result+="${sep}${item}"
+    sep=","
+  done
+  result+="]"
+  printf '%s' "${result}"
+}
+
+metric_list_contains() {
+  local metrics="$1"
+  local needle="$2"
+  [[ ",${metrics}," == *",${needle},"* || "${metrics}" == "all" ]]
+}
+
 val_files_override() {
   printf "['%s','%s','%s','%s']" \
     "${SAVE_DIR}/data/math-ai/math500/test_repeated.parquet" \
@@ -269,6 +296,44 @@ val_files_override() {
 
 tau_tag() {
   printf '%s' "$1" | sed 's/-/m/g; s/\./p/g'
+}
+
+gamma_tag() {
+  tau_tag "$1"
+}
+
+coeff_tag() {
+  printf '%s' "$1" | sed 's/-/m/g; s/\./p/g; s/e-/em/g; s/e+/ep/g'
+}
+
+baseline_naive_exp_name() {
+  printf 'baseline-naive-calib-tau0-s%s' "${CALIBRATION_STEPS}"
+}
+
+baseline_entropy_exp_name() {
+  printf 'baseline-entropy-mean-tau0-s%s' "${TOTAL_TRAINING_STEPS}"
+}
+
+tau_plan_path() {
+  printf '%s/tau_plan_%s.csv' "${EVAL_DIR}" "$1"
+}
+
+gamma_best_env_path() {
+  printf '%s/gamma_best_%s.env' "${EVAL_DIR}" "${TARGET_SIMILARITY_FOR_GAMMA_SEARCH}"
+}
+
+gamma_search_exp_name() {
+  local algorithm="$1"
+  local gamma="$2"
+  local tau="$3"
+  printf 'gamma-search-%s-g%s-tau%s-s%s' "${algorithm}" "$(gamma_tag "${gamma}")" "$(tau_tag "${tau}")" "${TOTAL_TRAINING_STEPS}"
+}
+
+main_aer_exp_name() {
+  local algorithm="$1"
+  local gamma="$2"
+  local tau="$3"
+  printf 'aer-%s-g%s-tau%s-s%s' "${algorithm}" "$(gamma_tag "${gamma}")" "$(tau_tag "${tau}")" "${TOTAL_TRAINING_STEPS}"
 }
 
 trainer_logger_override() {
@@ -285,17 +350,92 @@ ray_cpu_override_arg() {
   fi
 }
 
+# 后台 watcher：训练期间轮询 validation 目录，每发现新 JSONL 就立即评测该步。
+EVAL_WATCHER_PID=""
+EVAL_WATCHER_STOP_FILE=""
+
+start_eval_watcher() {
+  local exp_name="$1"
+  bool_is_true "${RUN_EVAL_AFTER_TRAIN}" || return 0
+
+  local input_dir="${SAVE_DIR}/validation/${exp_name}"
+  local output_dir="${EVAL_DIR}/${exp_name}/jsonl"
+  mkdir -p "${input_dir}" "${output_dir}"
+
+  EVAL_WATCHER_STOP_FILE="${TMP_DIR}/.eval_watcher_stop_${exp_name}"
+  rm -f "${EVAL_WATCHER_STOP_FILE}"
+
+  (
+    cd "${AER_DIR}"
+    while [[ ! -f "${EVAL_WATCHER_STOP_FILE}" ]]; do
+      local jsonl_file
+      for jsonl_file in "${input_dir}"/*.jsonl; do
+        [[ -f "${jsonl_file}" ]] || continue
+        local step_name
+        step_name="$(basename "${jsonl_file}" .jsonl)"
+        local step_output_dir="${output_dir}/${step_name}"
+        [[ -s "${step_output_dir}/validation_summary.csv" ]] && continue
+        log "[watcher] 评测 ${exp_name} step ${step_name}"
+        python eval/eval_from_jsonl.py \
+          --input "${jsonl_file}" \
+          --output-dir "${step_output_dir}" \
+          --metrics "${AFTER_TRAIN_EVAL_METRICS}" \
+          --ks "${AFTER_TRAIN_EVAL_KS}" \
+          --semantic-model "${EMBEDDING_MODEL_PATH}" \
+          --semantic-device "${AFTER_TRAIN_EVAL_SEMANTIC_DEVICE:-cpu}" \
+          --semantic-batch-size "${AFTER_TRAIN_EVAL_SEMANTIC_BATCH_SIZE:-32}" \
+          --semantic-max-length "${AFTER_TRAIN_EVAL_SEMANTIC_MAX_LENGTH:-1024}" 2>/dev/null || true
+      done
+      sleep 30
+    done
+    # 停止信号后做最后一轮扫描
+    for jsonl_file in "${input_dir}"/*.jsonl; do
+      [[ -f "${jsonl_file}" ]] || continue
+      local step_name
+      step_name="$(basename "${jsonl_file}" .jsonl)"
+      local step_output_dir="${output_dir}/${step_name}"
+      [[ -s "${step_output_dir}/validation_summary.csv" ]] && continue
+      log "[watcher] 最终评测 ${exp_name} step ${step_name}"
+      python eval/eval_from_jsonl.py \
+        --input "${jsonl_file}" \
+        --output-dir "${step_output_dir}" \
+        --metrics "${AFTER_TRAIN_EVAL_METRICS}" \
+        --ks "${AFTER_TRAIN_EVAL_KS}" \
+        --semantic-model "${EMBEDDING_MODEL_PATH}" \
+        --semantic-device "${AFTER_TRAIN_EVAL_SEMANTIC_DEVICE:-cpu}" \
+        --semantic-batch-size "${AFTER_TRAIN_EVAL_SEMANTIC_BATCH_SIZE:-32}" \
+        --semantic-max-length "${AFTER_TRAIN_EVAL_SEMANTIC_MAX_LENGTH:-1024}" 2>/dev/null || true
+    done
+  ) &
+  EVAL_WATCHER_PID="$!"
+  EVAL_BG_PIDS+=("${EVAL_WATCHER_PID}")
+  log "启动后台评测 watcher (PID=${EVAL_WATCHER_PID}): ${exp_name}"
+}
+
+stop_eval_watcher() {
+  if [[ -n "${EVAL_WATCHER_STOP_FILE}" ]]; then
+    touch "${EVAL_WATCHER_STOP_FILE}"
+  fi
+  EVAL_WATCHER_PID=""
+  EVAL_WATCHER_STOP_FILE=""
+}
+
 run_experiment() {
   local exp_name="$1"
   local algorithm="$2"
   local tau="$3"
   local total_steps="$4"
   local entropy_coeff="${5:-0.0}"
+  local exploration_algorithms="${6:-}"
+  local delayed_algorithms="${7:-}"
+  local delay_fraction="${8:-1.0}"
   local marker="${STATE_DIR}/${exp_name}.done"
   local log_file="${LOG_DIR}/${exp_name}.log"
   local val_files
   local trainer_logger
   local ray_cpu_arg
+  local exploration_list
+  local delayed_list
 
   if [[ -f "${marker}" ]] && ! bool_is_true "${FORCE_RERUN}"; then
     log "实验已完成，跳过: ${exp_name}"
@@ -305,8 +445,10 @@ run_experiment() {
   val_files="$(val_files_override)"
   trainer_logger="$(trainer_logger_override)"
   ray_cpu_arg="$(ray_cpu_override_arg)"
+  exploration_list="$(hydra_list_from_string "${exploration_algorithms}")"
+  delayed_list="$(hydra_list_from_string "${delayed_algorithms}")"
 
-  log "启动实验 ${exp_name}: algorithm=${algorithm}, tau=${tau}, entropy_coeff=${entropy_coeff}, steps=${total_steps}"
+  log "启动实验 ${exp_name}: algorithm=${algorithm}, tau=${tau}, entropy_coeff=${entropy_coeff}, steps=${total_steps}, extra_metrics=${exploration_list}"
 
   local cmd=(
     python -m recipe.aer.src.main_ppo
@@ -349,10 +491,22 @@ run_experiment() {
     "algorithm.adv_estimator=grpo"
     "algorithm.tau=${tau}"
     "algorithm.similarity_algorithm=${algorithm}"
+    "algorithm.exploration_metric_algorithms=${exploration_list}"
+    "algorithm.exploration_metric_delayed_algorithms=${delayed_list}"
+    "algorithm.exploration_metric_delay_fraction=${delay_fraction}"
     "algorithm.similarity_params.n=${SIMILARITY_N}"
+    "algorithm.similarity_params.normalize_method=${SIMILARITY_NORMALIZE_METHOD:-max}"
+    "algorithm.similarity_params.max_features=${SIMILARITY_MAX_FEATURES:-1000}"
+    "algorithm.similarity_params.min_df=${SIMILARITY_MIN_DF:-1}"
+    "algorithm.similarity_params.max_df=${SIMILARITY_MAX_DF:-1.0}"
+    "algorithm.similarity_params.ngram_range=${SIMILARITY_NGRAM_RANGE:-[1,2]}"
+    "algorithm.similarity_params.hash_bits=${SIMILARITY_HASH_BITS:-64}"
+    "algorithm.similarity_params.use_counts=${SIMILARITY_USE_COUNTS:-true}"
+    "algorithm.similarity_params.calibrate_random=${SIMILARITY_CALIBRATE_RANDOM:-true}"
     "algorithm.similarity_params.model_name='${EMBEDDING_MODEL_PATH}'"
     "algorithm.similarity_params.batch_size=${SIMILARITY_BATCH_SIZE}"
     "algorithm.similarity_params.max_length=${SIMILARITY_MAX_LENGTH}"
+    "algorithm.similarity_params.tail_tokens=${SIMILARITY_TAIL_TOKENS:-1024}"
     "algorithm.similarity_params.device=${SIMILARITY_DEVICE}"
     "algorithm.similarity_params.num_processes=${SIMILARITY_NUM_PROCESSES}"
     "trainer.total_epochs=100"
@@ -375,6 +529,9 @@ run_experiment() {
   if [[ -n "${ray_cpu_arg}" ]]; then
     cmd+=("${ray_cpu_arg}")
   fi
+  if [[ "${SIMILARITY_DEVICE}" == cuda* && -n "${SIMILARITY_CUDA_VISIBLE_DEVICES:-}" && "${SIMILARITY_CUDA_VISIBLE_DEVICES}" != "null" ]]; then
+    cmd+=("algorithm.similarity_params.cuda_visible_devices=${SIMILARITY_CUDA_VISIBLE_DEVICES}")
+  fi
 
   printf '\n[%s] CMD:' "$(date '+%Y-%m-%d %H:%M:%S')" >> "${log_file}"
   printf ' %q' "${cmd[@]}" >> "${log_file}"
@@ -392,10 +549,13 @@ run_experiment() {
   apply_network_env
   cd "${VERL_DIR}"
 
+  # 训练期间后台 watcher 实时评测每一步 validation JSONL（纯 CPU，不占 GPU）。
+  start_eval_watcher "${exp_name}"
   "${cmd[@]}" 2>&1 | tee -a "${log_file}"
   touch "${marker}"
+  # 通知 watcher 训练已结束，让它做最后一轮扫描后自行退出。
+  stop_eval_watcher
   export_train_log "${exp_name}" "${log_file}"
-  eval_jsonl_if_available "${exp_name}" "${total_steps}"
   stop_ray_if_needed
 }
 
@@ -408,7 +568,8 @@ export_train_log() {
     cd "${AER_DIR}"
     python eval/evaluate_aer.py train-log \
       --input "${log_file}" \
-      --output-dir "${EVAL_DIR}/${exp_name}/train_log" || true
+      --output-dir "${EVAL_DIR}/${exp_name}/train_log" \
+      --all-keys || true
   fi
 }
 
@@ -418,116 +579,318 @@ eval_jsonl_if_available() {
   bool_is_true "${RUN_EVAL_AFTER_TRAIN}" || return 0
 
   local input_dir="${SAVE_DIR}/validation/${exp_name}"
-  local input_path="${input_dir}"
   if [[ ! -d "${input_dir}" ]]; then
     log "未找到 validation JSONL 目录，跳过离线评测: ${input_dir}"
     return 0
   fi
 
-  if bool_is_true "${EVAL_LAST_STEP_ONLY:-1}"; then
-    if [[ -n "${expected_step}" && -f "${input_dir}/${expected_step}.jsonl" ]]; then
-      input_path="${input_dir}/${expected_step}.jsonl"
-    else
-      input_path="$(
-        python - "${input_dir}" <<'PY'
-from pathlib import Path
-import sys
+  local output_dir="${EVAL_DIR}/${exp_name}/jsonl"
+  mkdir -p "${output_dir}"
 
-root = Path(sys.argv[1])
-numeric_paths = []
-fallback_paths = []
-for path in root.rglob("*.jsonl"):
-    fallback_paths.append(path)
-    try:
-        numeric_paths.append((int(path.stem), str(path), path))
-    except ValueError:
-        pass
-
-if numeric_paths:
-    print(max(numeric_paths)[2])
-elif fallback_paths:
-    print(sorted(fallback_paths)[-1])
-else:
-    sys.exit(1)
-PY
-      )" || {
-        log "未找到 validation JSONL 文件，跳过离线评测: ${input_dir}"
-        return 0
-      }
+  # 找出所有尚未评测的 JSONL 文件并逐个评测。
+  local jsonl_file
+  while IFS= read -r jsonl_file; do
+    [[ -n "${jsonl_file}" ]] || continue
+    local step_name
+    step_name="$(basename "${jsonl_file}" .jsonl)"
+    local step_output_dir="${output_dir}/${step_name}"
+    if [[ -s "${step_output_dir}/validation_summary.csv" ]]; then
+      continue
     fi
-    log "从最后一步 validation JSONL 计算评测指标: ${exp_name}, input=${input_path}"
-  else
-    log "从全部 validation JSONL 计算评测指标: ${exp_name}, input=${input_path}"
-  fi
-
-  cd "${AER_DIR}"
-  python eval/eval_from_jsonl.py \
-    --input "${input_path}" \
-    --output-dir "${EVAL_DIR}/${exp_name}/jsonl" \
-    --metrics "${EVAL_METRICS}" \
-    --ks "${EVAL_KS}" \
-    --semantic-model "${EMBEDDING_MODEL_PATH}" \
-    --semantic-device "${SIMILARITY_DEVICE}" || true
+    log "评测 ${exp_name} step ${step_name}"
+    cd "${AER_DIR}"
+    python eval/eval_from_jsonl.py \
+      --input "${jsonl_file}" \
+      --output-dir "${step_output_dir}" \
+      --metrics "${AFTER_TRAIN_EVAL_METRICS}" \
+      --ks "${AFTER_TRAIN_EVAL_KS}" \
+      --semantic-model "${EMBEDDING_MODEL_PATH}" \
+      --semantic-device "${AFTER_TRAIN_EVAL_SEMANTIC_DEVICE:-cpu}" \
+      --semantic-batch-size "${AFTER_TRAIN_EVAL_SEMANTIC_BATCH_SIZE:-32}" \
+      --semantic-max-length "${AFTER_TRAIN_EVAL_SEMANTIC_MAX_LENGTH:-1024}" || true
+  done < <(find "${input_dir}" -maxdepth 1 -name '*.jsonl' -type f | sort)
 }
 
 generate_tau_plan() {
-  local algorithm="$1"
-  local calib_exp="$2"
-  local calib_log="${LOG_DIR}/${calib_exp}.log"
-  local tau_csv="${EVAL_DIR}/tau_plan_${algorithm}.csv"
+  local calib_exp
+  local metrics_csv
+  calib_exp="$(baseline_naive_exp_name)"
+  metrics_csv="${EVAL_DIR}/${calib_exp}/train_log/train_metrics.csv"
 
-  [[ -s "${calib_log}" ]] || die "校准日志不存在，无法生成 tau: ${calib_log}"
+  if [[ ! -s "${metrics_csv}" && -s "${LOG_DIR}/${calib_exp}.log" ]]; then
+    export_train_log "${calib_exp}" "${LOG_DIR}/${calib_exp}.log"
+  fi
+  [[ -s "${metrics_csv}" ]] || die "校准指标不存在，无法生成 tau: ${metrics_csv}"
 
-  log "生成 tau 计划: ${algorithm}"
-  cd "${AER_DIR}"
-  python eval/evaluate_aer.py tau-plan \
-    --input "${calib_log}" \
-    --algorithm "${algorithm}" \
-    --output "${tau_csv}"
+  log "根据 T0 最小探索奖励生成 tau 表: ${CALIBRATION_METRIC_ALGORITHMS}"
+  python - "${metrics_csv}" "${CALIBRATION_METRIC_ALGORITHMS}" "${GAMMA_LIST}" "${EVAL_DIR}" "${TAU_PRECISION:-6}" <<'PY'
+import csv
+import sys
+from pathlib import Path
+
+metrics_csv, algorithms_raw, gammas_raw, eval_dir_raw, precision_raw = sys.argv[1:]
+algorithms = [item for item in algorithms_raw.split() if item]
+gammas = [float(item) for item in gammas_raw.split() if item]
+precision = int(precision_raw)
+eval_dir = Path(eval_dir_raw)
+eval_dir.mkdir(parents=True, exist_ok=True)
+
+with open(metrics_csv, encoding="utf-8") as f:
+    rows = list(csv.DictReader(f))
+if not rows:
+    raise SystemExit(f"校准指标为空: {metrics_csv}")
+
+for index, algorithm in enumerate(algorithms):
+    column = f"metric/exploration reward/{algorithm}"
+    if column not in rows[0] and index == 0:
+        column = "metric/exploration reward"
+    values = [float(row[column]) for row in rows if row.get(column) not in (None, "")]
+    if not values:
+        raise SystemExit(f"{metrics_csv} 中没有 {algorithm} 的探索奖励列")
+    min_reward = min(values)
+    output = eval_dir / f"tau_plan_{algorithm}.csv"
+    with output.open("w", encoding="utf-8", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=["algorithm", "min_exploration_reward", "gamma", "tau", "source_metric", "n_points"])
+        writer.writeheader()
+        for gamma in gammas:
+            writer.writerow({
+                "algorithm": algorithm,
+                "min_exploration_reward": min_reward,
+                "gamma": gamma,
+                "tau": round(min_reward * gamma, precision),
+                "source_metric": column,
+                "n_points": len(values),
+            })
+    print(f"已写入 {output}")
+PY
 }
 
-read_tau_value() {
+read_tau_for_gamma() {
   local algorithm="$1"
-  local column="$2"
-  local tau_csv="${EVAL_DIR}/tau_plan_${algorithm}.csv"
+  local gamma="$2"
+  local tau_csv
+  tau_csv="$(tau_plan_path "${algorithm}")"
 
-  python -c "import csv; p='${tau_csv}'; c='${column}'; row=next(csv.DictReader(open(p, encoding='utf-8'))); print(row[c])"
+  python - "${tau_csv}" "${algorithm}" "${gamma}" <<'PY'
+import csv
+import math
+import sys
+
+path, algorithm, gamma = sys.argv[1:]
+target = float(gamma)
+with open(path, encoding="utf-8") as f:
+    for row in csv.DictReader(f):
+        if row.get("algorithm") == algorithm and math.isclose(float(row["gamma"]), target, rel_tol=0.0, abs_tol=1e-12):
+            print(row["tau"])
+            break
+    else:
+        raise SystemExit(f"{path} 中没有 algorithm={algorithm}, gamma={gamma}")
+PY
 }
 
-run_aer_queue() {
+ensure_tau_plan() {
   local algorithm
-  for algorithm in ${EXPERIMENT_ALGORITHMS}; do
-    local calib_exp="calib-${algorithm}-tau0-s${CALIBRATION_STEPS}"
-    run_experiment "${calib_exp}" "${algorithm}" "0" "${CALIBRATION_STEPS}" "0.0"
-    generate_tau_plan "${algorithm}" "${calib_exp}"
-
-    local label
-    for label in low mid high; do
-      local column="tau_${label}"
-      local tau
-      local tau_name
-      local exp_name
-      tau="$(read_tau_value "${algorithm}" "${column}")"
-      tau_name="$(tau_tag "${tau}")"
-      exp_name="aer-${algorithm}-${label}-tau${tau_name}-s${TOTAL_TRAINING_STEPS}"
-      run_experiment "${exp_name}" "${algorithm}" "${tau}" "${TOTAL_TRAINING_STEPS}" "0.0"
-    done
+  for algorithm in ${CALIBRATION_METRIC_ALGORITHMS}; do
+    if [[ ! -s "$(tau_plan_path "${algorithm}")" ]]; then
+      if bool_is_true "${DRY_RUN:-0}"; then
+        return 0
+      fi
+      generate_tau_plan
+      return 0
+    fi
   done
 }
 
-coeff_tag() {
-  printf '%s' "$1" | sed 's/-/m/g; s/\./p/g; s/e-/em/g; s/e+/ep/g'
+select_gamma_best() {
+  local algorithm="${TARGET_SIMILARITY_FOR_GAMMA_SEARCH}"
+  local output_env
+  output_env="$(gamma_best_env_path)"
+
+  log "根据训练后 CPU 评测结果选择 gamma_best: ${algorithm}"
+  python - "$(tau_plan_path "${algorithm}")" "${algorithm}" "${GAMMA_LIST}" "${EVAL_DIR}" "${TOTAL_TRAINING_STEPS}" "${GAMMA_SELECTION_PRIMARY_METRIC:-correct_rate}" "${GAMMA_SELECTION_TIEBREAK_METRIC:-distinct_2}" "${output_env}" <<'PY'
+import csv
+import math
+import sys
+from pathlib import Path
+
+tau_csv, algorithm, gammas_raw, eval_dir_raw, steps, primary_metric, tie_metric, output_env = sys.argv[1:]
+eval_dir = Path(eval_dir_raw)
+
+def tag(value):
+    return str(value).replace("-", "m").replace(".", "p")
+
+def tau_for(gamma):
+    target = float(gamma)
+    with open(tau_csv, encoding="utf-8") as f:
+        for row in csv.DictReader(f):
+            if row.get("algorithm") == algorithm and math.isclose(float(row["gamma"]), target, rel_tol=0.0, abs_tol=1e-12):
+                return row["tau"]
+    raise SystemExit(f"{tau_csv} 中没有 gamma={gamma}")
+
+def summary_row(exp_name):
+    base = eval_dir / exp_name / "jsonl"
+    # 优先查找按步存放的子目录（watcher 模式），取最大步数的结果。
+    step_dirs = sorted(
+        [d for d in base.iterdir() if d.is_dir() and d.name.isdigit()],
+        key=lambda d: int(d.name),
+    ) if base.is_dir() else []
+    if step_dirs:
+        path = step_dirs[-1] / "validation_summary.csv"
+    else:
+        path = base / "validation_summary.csv"
+    if not path.exists():
+        raise SystemExit(f"缺少 gamma 评测结果，无法自动选择 gamma_best: {path}")
+    rows = list(csv.DictReader(path.open(encoding="utf-8")))
+    for preferred in ("AVG_DATASETS", "all"):
+        for row in rows:
+            if row.get("data_source") == preferred:
+                return row
+    if rows:
+        return rows[0]
+    raise SystemExit(f"评测结果为空: {path}")
+
+def number(row, *keys, default=float("-inf")):
+    for key in keys:
+        value = row.get(key)
+        if value not in (None, ""):
+            try:
+                return float(value)
+            except ValueError:
+                pass
+    return default
+
+best = None
+for gamma in [item for item in gammas_raw.split() if item]:
+    tau = tau_for(gamma)
+    exp_name = f"gamma-search-{algorithm}-g{tag(gamma)}-tau{tag(tau)}-s{steps}"
+    row = summary_row(exp_name)
+    primary = number(row, primary_metric, "correct_rate", "first@1", "pass@8", "pass@4", "pass@1")
+    tie = number(row, tie_metric, "distinct_2")
+    self_bleu_bonus = -number(row, "self_bleu4", default=float("inf"))
+    candidate = ((primary, tie, self_bleu_bonus), gamma, tau, exp_name)
+    if best is None or candidate[0] > best[0]:
+        best = candidate
+
+_, gamma, tau, exp_name = best
+Path(output_env).write_text(
+    f"GAMMA_BEST={gamma}\nGAMMA_BEST_TAU={tau}\nGAMMA_BEST_EXPERIMENT={exp_name}\n",
+    encoding="utf-8",
+)
+print(f"gamma_best={gamma}, tau={tau}, experiment={exp_name}")
+PY
 }
 
-run_entropy_baselines() {
-  [[ -n "${ENTROPY_BASELINE_COEFFS:-}" ]] || return 0
+resolve_gamma_best() {
+  if [[ -n "${GAMMA_BEST:-}" && "${GAMMA_BEST}" != "auto" ]]; then
+    printf '%s' "${GAMMA_BEST}"
+    return 0
+  fi
+  if bool_is_true "${DRY_RUN:-0}"; then
+    first_word "${GAMMA_LIST}"
+    return 0
+  fi
+  local gamma_env
+  gamma_env="$(gamma_best_env_path)"
+  if [[ ! -s "${gamma_env}" ]]; then
+    select_gamma_best
+  fi
+  # shellcheck source=/dev/null
+  source "${gamma_env}"
+  printf '%s' "${GAMMA_BEST}"
+}
 
-  local coeff
-  for coeff in ${ENTROPY_BASELINE_COEFFS}; do
-    local tag
-    tag="$(coeff_tag "${coeff}")"
-    run_experiment "baseline-entropy-grpo-c${tag}-s${TOTAL_TRAINING_STEPS}" "token_match" "0" "${TOTAL_TRAINING_STEPS}" "${coeff}"
+run_baseline_naive() {
+  bool_is_true "${RUN_BASELINE_NAIVE:-1}" || return 0
+  run_experiment "$(baseline_naive_exp_name)" "${BASELINE_SIMILARITY_ALGORITHM:-token_match}" "0" "${CALIBRATION_STEPS}" "0.0" "${CALIBRATION_METRIC_ALGORITHMS}" "${CALIBRATION_DELAYED_ALGORITHMS:-}" "${CALIBRATION_DELAY_FRACTION:-1.0}"
+  bool_is_true "${DRY_RUN:-0}" || generate_tau_plan
+}
+
+run_baseline_entropy() {
+  bool_is_true "${RUN_BASELINE_ENTROPY:-1}" || return 0
+  run_experiment "$(baseline_entropy_exp_name)" "${BASELINE_SIMILARITY_ALGORITHM:-token_match}" "0" "${TOTAL_TRAINING_STEPS}" "${ENTROPY_BASELINE_COEFF:-0.0}" ""
+}
+
+run_gamma_search() {
+  bool_is_true "${RUN_GAMMA_SEARCH:-1}" || return 0
+  ensure_tau_plan
+
+  local gamma
+  for gamma in ${GAMMA_LIST}; do
+    local tau
+    if bool_is_true "${DRY_RUN:-0}" && [[ ! -s "$(tau_plan_path "${TARGET_SIMILARITY_FOR_GAMMA_SEARCH}")" ]]; then
+      tau="0"
+    else
+      tau="$(read_tau_for_gamma "${TARGET_SIMILARITY_FOR_GAMMA_SEARCH}" "${gamma}")"
+    fi
+    run_experiment "$(gamma_search_exp_name "${TARGET_SIMILARITY_FOR_GAMMA_SEARCH}" "${gamma}" "${tau}")" "${TARGET_SIMILARITY_FOR_GAMMA_SEARCH}" "${tau}" "${TOTAL_TRAINING_STEPS}" "0.0" ""
   done
+
+  if [[ "${GAMMA_BEST:-auto}" == "auto" ]] && ! bool_is_true "${DRY_RUN:-0}"; then
+    select_gamma_best
+  fi
+}
+
+run_main_aer() {
+  bool_is_true "${RUN_MAIN_AER:-1}" || return 0
+  ensure_tau_plan
+
+  local gamma_best
+  gamma_best="$(resolve_gamma_best)"
+  local algorithm
+  for algorithm in ${MAIN_SIMILARITY_ALGORITHMS}; do
+    local tau
+    if bool_is_true "${DRY_RUN:-0}" && [[ ! -s "$(tau_plan_path "${algorithm}")" ]]; then
+      tau="0"
+    else
+      tau="$(read_tau_for_gamma "${algorithm}" "${gamma_best}")"
+    fi
+    if [[ "${algorithm}" == "${TARGET_SIMILARITY_FOR_GAMMA_SEARCH}" ]] && bool_is_true "${REUSE_GAMMA_SEARCH_FOR_TARGET:-1}"; then
+      log "主实验 ${algorithm} 复用 gamma 搜索 run: $(gamma_search_exp_name "${algorithm}" "${gamma_best}" "${tau}")"
+      continue
+    fi
+    run_experiment "$(main_aer_exp_name "${algorithm}" "${gamma_best}" "${tau}")" "${algorithm}" "${tau}" "${TOTAL_TRAINING_STEPS}" "0.0" ""
+  done
+}
+
+run_extra_aer() {
+  bool_is_true "${RUN_EXTRA_AER:-0}" || return 0
+  [[ -n "${EXTRA_SIMILARITY_ALGORITHMS:-}" ]] || return 0
+  ensure_tau_plan
+
+  local gamma_best
+  gamma_best="$(resolve_gamma_best)"
+  local algorithm
+  for algorithm in ${EXTRA_SIMILARITY_ALGORITHMS}; do
+    local tau
+    tau="$(read_tau_for_gamma "${algorithm}" "${gamma_best}")"
+    run_experiment "$(main_aer_exp_name "${algorithm}" "${gamma_best}" "${tau}")" "${algorithm}" "${tau}" "${TOTAL_TRAINING_STEPS}" "0.0" ""
+  done
+}
+
+EVAL_BG_PIDS=()
+
+wait_eval_bg() {
+  if [[ "${#EVAL_BG_PIDS[@]}" -eq 0 ]]; then
+    return 0
+  fi
+  log "等待 ${#EVAL_BG_PIDS[@]} 个后台 CPU 评测完成..."
+  local pid
+  for pid in "${EVAL_BG_PIDS[@]}"; do
+    wait "${pid}" 2>/dev/null || true
+  done
+  EVAL_BG_PIDS=()
+}
+
+run_training_queue() {
+  run_baseline_naive
+  run_baseline_entropy
+  # gamma_best 自动选择依赖 gamma search 的评测结果，需等待评测完成。
+  wait_eval_bg
+  run_gamma_search
+  wait_eval_bg
+  run_main_aer
+  run_extra_aer
+  wait_eval_bg
 }
 
 check_inputs() {
@@ -535,7 +898,7 @@ check_inputs() {
   [[ -d "${VERL_DIR}" ]] || die "未找到 verl 目录: ${VERL_DIR}"
   [[ -f "${REPO_ROOT}/environment.yml" ]] || die "未找到 environment.yml"
   if [[ "${command}" =~ ^(setup|train|all)$ && "${WANDB_MODE}" == "online" && -z "${WANDB_API_KEY:-}" ]] && ! bool_is_true "${DRY_RUN:-0}"; then
-    die "请先复制 config.example.env 为 config.env，并填写 WANDB_API_KEY。"
+    die "请在 ${CONFIG_FILE} 中填写 WANDB_API_KEY，或把 WANDB_MODE 改成 offline/disabled。"
   fi
 }
 
@@ -545,12 +908,26 @@ REPO_ROOT=${REPO_ROOT}
 SAVE_DIR=${SAVE_DIR}
 CONFIG_FILE=${CONFIG_FILE}
 CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES}
-EXPERIMENT_ALGORITHMS=${EXPERIMENT_ALGORITHMS}
+RUN_BASELINE_NAIVE=${RUN_BASELINE_NAIVE}
+RUN_BASELINE_ENTROPY=${RUN_BASELINE_ENTROPY}
+RUN_GAMMA_SEARCH=${RUN_GAMMA_SEARCH}
+RUN_MAIN_AER=${RUN_MAIN_AER}
+CALIBRATION_METRIC_ALGORITHMS=${CALIBRATION_METRIC_ALGORITHMS}
 CALIBRATION_STEPS=${CALIBRATION_STEPS}
 TOTAL_TRAINING_STEPS=${TOTAL_TRAINING_STEPS}
+TARGET_SIMILARITY_FOR_GAMMA_SEARCH=${TARGET_SIMILARITY_FOR_GAMMA_SEARCH}
+GAMMA_LIST=${GAMMA_LIST}
+GAMMA_BEST=${GAMMA_BEST}
+MAIN_SIMILARITY_ALGORITHMS=${MAIN_SIMILARITY_ALGORITHMS}
+SIMILARITY_DEVICE=${SIMILARITY_DEVICE}
+SIMILARITY_CUDA_VISIBLE_DEVICES=${SIMILARITY_CUDA_VISIBLE_DEVICES:-}
+SIMILARITY_NUM_PROCESSES=${SIMILARITY_NUM_PROCESSES}
+AFTER_TRAIN_EVAL_METRICS=${AFTER_TRAIN_EVAL_METRICS}
+AFTER_TRAIN_EVAL_KS=${AFTER_TRAIN_EVAL_KS}
 WANDB_MODE=${WANDB_MODE}
 WANDB_PROJECT=${WANDB_PROJECT}
 MODEL_PATH=${MODEL_PATH}
+EMBEDDING_MODEL_PATH=${EMBEDDING_MODEL_PATH}
 EOF
 }
 
@@ -575,16 +952,14 @@ main() {
       run_smoke_tests
       ;;
     train)
-      run_entropy_baselines
-      run_aer_queue
+      run_training_queue
       ;;
     all)
       setup_env
       download_models
       prepare_data
       run_smoke_tests
-      run_entropy_baselines
-      run_aer_queue
+      run_training_queue
       ;;
     *)
       die "未知命令: ${command}。可选: status/setup/assets/test/train/all"
