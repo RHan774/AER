@@ -61,28 +61,28 @@ class RougeLSimilarity(BatchSimilarityComputer):
         self.beta_squared = beta * beta
         self.tokenize_by_space = tokenize_by_space
 
-    def _tokenize(self, text: str) -> list[str]:
+    def _tokenize(self, text: str) -> tuple[str, ...]:
         if self.use_char_level:
-            return list(text)
+            return tuple(text)
         if self.tokenize_by_space:
-            return text.split()
+            return tuple(text.split())
         stripped = [char for char in text if not char.isspace()]
-        return stripped or list(text)
+        return tuple(stripped or list(text))
 
     @staticmethod
-    def _lcs_length(seq1: list[str], seq2: list[str]) -> int:
+    def _lcs_length(seq1: tuple[str, ...], seq2: tuple[str, ...]) -> int:
         if len(seq1) < len(seq2):
             seq1, seq2 = seq2, seq1
 
         dp = [0] * (len(seq2) + 1)
-        for i in range(1, len(seq1) + 1):
+        for token1 in seq1:
             prev = 0
-            for j in range(1, len(seq2) + 1):
+            for j, token2 in enumerate(seq2, start=1):
                 current = dp[j]
-                if seq1[i - 1] == seq2[j - 1]:
+                if token1 == token2:
                     dp[j] = prev + 1
-                else:
-                    dp[j] = max(dp[j], dp[j - 1])
+                elif dp[j - 1] > current:
+                    dp[j] = dp[j - 1]
                 prev = current
         return dp[-1]
 
@@ -92,7 +92,7 @@ class RougeLSimilarity(BatchSimilarityComputer):
         denominator = recall + self.beta_squared * precision
         return ((1 + self.beta_squared) * precision * recall) / denominator if denominator > 0 else 0.0
 
-    def _compute_similarity(self, seq1: list[str], seq2: list[str]) -> float:
+    def _compute_similarity(self, seq1: tuple[str, ...], seq2: tuple[str, ...]) -> float:
         if not seq1 and not seq2:
             return 1.0
         if not seq1 or not seq2:

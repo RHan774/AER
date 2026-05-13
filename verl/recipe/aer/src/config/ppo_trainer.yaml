@@ -703,6 +703,12 @@ algorithm:
   # 额外记录探索奖励指标的算法列表；设为 ["all"] 时使用 similarity 注册表中的所有算法。
   exploration_metric_algorithms: []
 
+  # 额外指标中需要延后到训练最后阶段才计算的重算法；不会影响 similarity_algorithm 对训练奖励的计算。
+  exploration_metric_delayed_algorithms: []
+
+  # 延后指标开始计算的最后训练步比例；1.0 表示全程计算，0.1 表示只在最后 10% step 计算。
+  exploration_metric_delay_fraction: 1.0
+
   # add: 相似度算法参数
   similarity_params:
 

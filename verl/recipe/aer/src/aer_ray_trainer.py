@@ -17,16 +17,17 @@ This trainer supports model-agonistic model initialization with huggingface
 """
 
 import uuid
+from pprint import pprint
+
 import numpy as np
 import torch
-
-from pprint import pprint
 from tqdm import tqdm
+
 from verl import DataProto
-from verl.trainer.ppo.core_algos import agg_loss
 from verl.trainer.ppo import core_algos
-from verl.trainer.ppo.ray_trainer import RayPPOTrainer, AdvantageEstimator, _timer, compute_response_mask
+from verl.trainer.ppo.core_algos import agg_loss
 from verl.trainer.ppo.metric_utils import compute_data_metrics, compute_throughout_metrics, compute_timing_metrics, reduce_metrics
+from verl.trainer.ppo.ray_trainer import AdvantageEstimator, RayPPOTrainer, _timer, compute_response_mask
 
 
 def compute_advantage(data: DataProto, adv_estimator: str) -> DataProto:
@@ -156,11 +157,14 @@ class RayAERTrainer(RayPPOTrainer):
 
                     # compute global_valid tokens
                     batch.meta_info["global_token_num"] = torch.sum(batch.batch["attention_mask"], dim=-1).tolist()
+                    batch.meta_info["_aer_global_step"] = self.global_steps
+                    batch.meta_info["_aer_total_training_steps"] = self.total_training_steps
 
                     with _timer("reward", timing_raw):
                         reward_result = self.reward_fn(batch)
                         reward_tensor_acc = reward_result["reward_tensor_acc"]
                         reward_tensor_exploration = reward_result["reward_tensor_exploration"]
+                        reward_exploration_metrics_by_algorithm = reward_result.get("reward_exploration_metrics_by_algorithm", {})
                         reward_tensors_exploration_by_algorithm = reward_result.get("reward_tensors_exploration_by_algorithm", {})
                         reward_extra_infos_dict = reward_result["reward_extra_info"]
                         batch.non_tensor_batch.update({k: np.array(v) for k, v in reward_extra_infos_dict.items()})
@@ -172,7 +176,10 @@ class RayAERTrainer(RayPPOTrainer):
                         weight = max(0.0, min(1.0, weight))
                         metrics.update({"metric/weight": weight})
                         metrics.update({"metric/acc reward": acc_reward})
-                        if reward_tensors_exploration_by_algorithm:
+                        if reward_exploration_metrics_by_algorithm:
+                            for algorithm, value in reward_exploration_metrics_by_algorithm.items():
+                                metrics.update({f"metric/exploration reward/{algorithm}": value})
+                        elif reward_tensors_exploration_by_algorithm:
                             for algorithm, exploration_tensor in reward_tensors_exploration_by_algorithm.items():
                                 metrics.update({f"metric/exploration reward/{algorithm}": exploration_tensor.sum(-1).mean().item()})
                         else:
@@ -183,7 +190,6 @@ class RayAERTrainer(RayPPOTrainer):
                         old_log_prob = self.actor_rollout_wg.compute_log_prob(batch)
                         entropys = old_log_prob.batch["entropys"]
                         response_masks = batch.batch["response_mask"]
-                        loss_agg_mode = self.config.actor_rollout_ref.actor.loss_agg_mode
                         entropy_loss = agg_loss(loss_mat=entropys, loss_mask=response_masks, loss_agg_mode="seq-mean-token-mean")
                         old_log_prob_metrics = {"actor/entropy_loss": entropy_loss.detach().item()}
                         metrics.update(old_log_prob_metrics)

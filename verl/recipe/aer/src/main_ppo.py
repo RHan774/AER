@@ -49,7 +49,9 @@ def run_ppo(config) -> None:
 class TaskRunner:
     def run(self, config):
         from pprint import pprint
+
         from omegaconf import OmegaConf
+
         from verl.utils.fs import copy_to_local
         pprint(OmegaConf.to_container(config, resolve=True))  # resolve=True will eval symbol values
         OmegaConf.resolve(config)
@@ -123,7 +125,7 @@ class TaskRunner:
             from verl.workers.reward_manager import PrimeRewardManager
             reward_manager_cls = PrimeRewardManager
         elif reward_manager_name == "aer":
-            from .reward_manager import RLRewardManager, AERRewardManager
+            from .reward_manager import AERRewardManager, RLRewardManager
             reward_manager_cls = RLRewardManager
             train_reward_manager_cls = AERRewardManager
         else:
@@ -133,6 +135,8 @@ class TaskRunner:
         similarity_algorithm = config.algorithm.get("similarity_algorithm", "token_match")
         similarity_params = config.algorithm.get("similarity_params", {})
         exploration_metric_algorithms = config.algorithm.get("exploration_metric_algorithms", [])
+        exploration_metric_delayed_algorithms = config.algorithm.get("exploration_metric_delayed_algorithms", [])
+        exploration_metric_delay_fraction = config.algorithm.get("exploration_metric_delay_fraction", 1.0)
 
         # add: 将相似度算法配置传递给 reward manager
         reward_fn_kwargs = {
@@ -145,6 +149,8 @@ class TaskRunner:
             "similarity_algorithm": similarity_algorithm,
             "similarity_params": similarity_params,
             "exploration_metric_algorithms": exploration_metric_algorithms,
+            "exploration_metric_delayed_algorithms": exploration_metric_delayed_algorithms,
+            "exploration_metric_delay_fraction": exploration_metric_delay_fraction,
         }
 
         reward_fn = reward_manager_cls(**reward_fn_kwargs)

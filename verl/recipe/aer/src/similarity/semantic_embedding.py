@@ -39,7 +39,7 @@ else:
 
 
 _MODEL_CACHE: dict[tuple[str, str, int, str | None], SentenceTransformer] = {}
-_POOL_CACHE: dict[tuple[str, str, int, int, str | None], "_EmbeddingWorkerPool"] = {}
+_POOL_CACHE: dict[tuple[str, str, int, int, str | None], _EmbeddingWorkerPool] = {}
 
 
 def _normalize_cuda_visible_devices(cuda_visible_devices: str | list[int | str] | tuple[int | str, ...] | None) -> list[str]:
@@ -354,6 +354,11 @@ class SemanticEmbeddingSimilarity(BatchSimilarityComputer):
         if tokenizer is None:
             raise ValueError(f"{self.__class__.__name__} 需要 tokenizer 才能解码文本")
 
+        cache = self._get_batch_cache(data)
+        cache_key = ("decoded_tail_responses", id(tokenizer), self.tail_tokens)
+        if cache_key in cache:
+            return cache[cache_key]
+
         responses = data.batch["responses"]
         valid_lengths = self._get_valid_response_lengths(data)
 
@@ -366,6 +371,7 @@ class SemanticEmbeddingSimilarity(BatchSimilarityComputer):
             start = 0 if self.tail_tokens is None else max(0, length - self.tail_tokens)
             token_ids = responses[idx, start:length].detach().cpu().tolist()
             texts.append(tokenizer.decode(token_ids, skip_special_tokens=True) if token_ids else "")
+        cache[cache_key] = texts
         return texts
 
     def _build_groupwise_similarity_matrix(self, data: DataProto, embeddings: torch.Tensor, target_device: torch.device) -> torch.Tensor:

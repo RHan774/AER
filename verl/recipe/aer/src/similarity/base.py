@@ -28,6 +28,9 @@ else:
     DataProto = Any
 
 
+_SIMILARITY_CACHE_KEY = "_aer_similarity_cache"
+
+
 class SimilarityComputer(ABC):
     """两两相似度计算接口。
 
@@ -39,6 +42,26 @@ class SimilarityComputer(ABC):
     def __init__(self, **kwargs):
         self.kwargs = kwargs
 
+    def _get_batch_cache(self, data: DataProto) -> dict[str, Any]:
+        """返回当前 batch 内可复用的相似度预处理缓存。"""
+
+        meta_info = getattr(data, "meta_info", None)
+        if isinstance(meta_info, dict):
+            cache = meta_info.get(_SIMILARITY_CACHE_KEY)
+            if cache is None:
+                cache = {}
+                meta_info[_SIMILARITY_CACHE_KEY] = cache
+            return cache
+
+        cache = getattr(data, _SIMILARITY_CACHE_KEY, None)
+        if cache is None:
+            cache = {}
+            try:
+                setattr(data, _SIMILARITY_CACHE_KEY, cache)
+            except Exception:
+                return {}
+        return cache
+
     @abstractmethod
     def compute(self, data: DataProto, tokenizer=None) -> torch.Tensor:
         """计算一个 batch 的两两相似度矩阵。"""
@@ -46,10 +69,17 @@ class SimilarityComputer(ABC):
 
     def _get_group_mask(self, data: DataProto, device: torch.device) -> torch.Tensor:
         """返回同一 UID 组内为 1 的稠密掩码矩阵。"""
+        cache = self._get_batch_cache(data)
+        cache_key = ("group_mask", str(device))
+        if cache_key in cache:
+            return cache[cache_key]
+
         ids = np.asarray(data.non_tensor_batch["uid"], dtype=object)
         _, inverse_indices = np.unique(ids, return_inverse=True)
         index_tensor = torch.as_tensor(inverse_indices, device=device, dtype=torch.long)
-        return (index_tensor.unsqueeze(0) == index_tensor.unsqueeze(1)).float()
+        group_mask = (index_tensor.unsqueeze(0) == index_tensor.unsqueeze(1)).float()
+        cache[cache_key] = group_mask
+        return group_mask
 
     def _get_group_indices(self, data: DataProto) -> list[list[int]]:
         """按 UID 返回样本索引分组。
@@ -57,10 +87,16 @@ class SimilarityComputer(ABC):
         返回顺序与输入 batch 顺序保持稳定，从而保证结果矩阵可复现。
         """
 
+        cache = self._get_batch_cache(data)
+        if "group_indices" in cache:
+            return cache["group_indices"]
+
         groups: dict[Any, list[int]] = {}
         for idx, uid in enumerate(np.asarray(data.non_tensor_batch["uid"], dtype=object).tolist()):
             groups.setdefault(uid, []).append(idx)
-        return list(groups.values())
+        group_indices = list(groups.values())
+        cache["group_indices"] = group_indices
+        return group_indices
 
     def _apply_group_mask(self, similarity_matrix: torch.Tensor, group_mask: torch.Tensor) -> torch.Tensor:
         """将不同 UID 组之间的相似度置零。"""
@@ -82,13 +118,22 @@ class SimilarityComputer(ABC):
         similarity_matrix = torch.zeros((batch_size, batch_size), device=device, dtype=torch.float32)
 
         for group in self._get_group_indices(data):
+            group_size = len(group)
+            if group_size == 0:
+                continue
+
+            group_values = [[0.0] * group_size for _ in range(group_size)]
             for offset, i in enumerate(group):
                 item_i = items[i]
-                similarity_matrix[i, i] = float(similarity_fn(item_i, item_i))
-                for j in group[offset + 1 :]:
+                group_values[offset][offset] = float(similarity_fn(item_i, item_i))
+                for local_j, j in enumerate(group[offset + 1 :], start=offset + 1):
                     sim = float(similarity_fn(item_i, items[j]))
-                    similarity_matrix[i, j] = sim
-                    similarity_matrix[j, i] = sim
+                    group_values[offset][local_j] = sim
+                    group_values[local_j][offset] = sim
+
+            group_index = torch.as_tensor(group, device=device, dtype=torch.long)
+            group_tensor = torch.tensor(group_values, device=device, dtype=torch.float32)
+            similarity_matrix[group_index.unsqueeze(1), group_index.unsqueeze(0)] = group_tensor
 
         return similarity_matrix
 
@@ -101,14 +146,26 @@ class BatchSimilarityComputer(SimilarityComputer):
 
     def _get_response_mask(self, data: DataProto) -> torch.Tensor:
         """返回与 ``batch['responses']`` 对齐的布尔有效掩码。"""
+        cache = self._get_batch_cache(data)
+        if "response_mask" in cache:
+            return cache["response_mask"]
+
         responses = data.batch["responses"]
         response_length = responses.size(1)
-        return data.batch["attention_mask"][:, -response_length:].to(dtype=torch.bool)
+        response_mask = data.batch["attention_mask"][:, -response_length:].to(dtype=torch.bool)
+        cache["response_mask"] = response_mask
+        return response_mask
 
     def _get_valid_response_lengths(self, data: DataProto) -> list[int]:
         """返回每个样本的有效 response 长度。"""
+        cache = self._get_batch_cache(data)
+        if "valid_response_lengths" in cache:
+            return cache["valid_response_lengths"]
+
         response_mask = self._get_response_mask(data)
-        return response_mask.sum(dim=1).to(dtype=torch.long).tolist()
+        valid_lengths = response_mask.sum(dim=1).to(dtype=torch.long).tolist()
+        cache["valid_response_lengths"] = valid_lengths
+        return valid_lengths
 
     def _get_response_token_lists(self, data: DataProto) -> list[list[int]]:
         """提取每个样本的有效 response token 序列。
@@ -120,8 +177,14 @@ class BatchSimilarityComputer(SimilarityComputer):
         """
 
         responses = data.batch["responses"]
+        cache = self._get_batch_cache(data)
+        if "response_token_lists" in cache:
+            return cache["response_token_lists"]
+
         valid_lengths = self._get_valid_response_lengths(data)
-        return [responses[idx, :length].tolist() for idx, length in enumerate(valid_lengths)]
+        token_lists = [responses[idx, :length].tolist() for idx, length in enumerate(valid_lengths)]
+        cache["response_token_lists"] = token_lists
+        return token_lists
 
     def _decode_responses(self, data: DataProto, tokenizer) -> list[str]:
         """将有效 response token 解码为字符串。
@@ -141,5 +204,12 @@ class BatchSimilarityComputer(SimilarityComputer):
         if tokenizer is None:
             raise ValueError(f"{self.__class__.__name__} 需要 tokenizer 才能解码文本")
 
+        cache = self._get_batch_cache(data)
+        cache_key = ("decoded_responses", id(tokenizer))
+        if cache_key in cache:
+            return cache[cache_key]
+
         token_lists = self._get_response_token_lists(data)
-        return [tokenizer.decode(token_ids, skip_special_tokens=True) if token_ids else "" for token_ids in token_lists]
+        texts = [tokenizer.decode(token_ids, skip_special_tokens=True) if token_ids else "" for token_ids in token_lists]
+        cache[cache_key] = texts
+        return texts

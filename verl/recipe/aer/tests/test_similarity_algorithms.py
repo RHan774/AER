@@ -2,6 +2,7 @@ import sys
 import types
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 import torch
 
@@ -13,8 +14,8 @@ if "verl" not in sys.modules:
     verl_stub.DataProto = object
     sys.modules["verl"] = verl_stub
 
+from recipe.aer.src.reward_manager import AERRewardManager, _normalize_metric_algorithms, _parse_golden_answer_cached  # noqa: E402
 from recipe.aer.src.similarity import get_similarity_computer, list_available_algorithms  # noqa: E402
-from recipe.aer.src.reward_manager import _normalize_metric_algorithms  # noqa: E402
 
 
 class FakeTokenizer:
@@ -33,7 +34,7 @@ class FakeItem:
 
 
 class FakeDataProto:
-    def __init__(self, responses, uids, prompt_len=2):
+    def __init__(self, responses, uids, prompt_len=2, reward_models=None, data_sources=None):
         batch_size = len(responses)
         max_response_len = max(len(response) for response in responses)
 
@@ -52,6 +53,11 @@ class FakeDataProto:
             "attention_mask": attention_mask,
         }
         self.non_tensor_batch = {"uid": list(uids)}
+        self.meta_info = {}
+        if reward_models is not None:
+            self.non_tensor_batch["reward_model"] = list(reward_models)
+        if data_sources is not None:
+            self.non_tensor_batch["data_source"] = list(data_sources)
 
     def __len__(self):
         return self.batch["responses"].shape[0]
@@ -241,6 +247,170 @@ class SimilarityAlgorithmTest(unittest.TestCase):
         algorithms = _normalize_metric_algorithms(["all"])
 
         self.assertEqual(algorithms, list_available_algorithms())
+
+    def test_delayed_metric_algorithms_only_activate_in_final_fraction(self):
+        manager = AERRewardManager(
+            tokenizer=FakeTokenizer({1: "a"}),
+            similarity_algorithm="token_match",
+            exploration_metric_algorithms=["token_match", "rouge_l", "simhash"],
+            exploration_metric_delayed_algorithms=["rouge_l"],
+            exploration_metric_delay_fraction=0.25,
+        )
+
+        early_algorithms = set(manager._get_active_exploration_metric_computers(75, 100))
+        final_algorithms = set(manager._get_active_exploration_metric_computers(76, 100))
+
+        self.assertEqual(early_algorithms, {"token_match", "simhash"})
+        self.assertEqual(final_algorithms, {"token_match", "rouge_l", "simhash"})
+
+    def test_training_similarity_algorithm_is_not_delayed_as_metric(self):
+        manager = AERRewardManager(
+            tokenizer=FakeTokenizer({1: "a"}),
+            similarity_algorithm="token_match",
+            exploration_metric_algorithms=["token_match", "rouge_l"],
+            exploration_metric_delayed_algorithms=["token_match", "rouge_l"],
+            exploration_metric_delay_fraction=0.1,
+        )
+
+        active_algorithms = set(manager._get_active_exploration_metric_computers(1, 100))
+
+        self.assertEqual(active_algorithms, {"token_match"})
+
+    def test_aer_reward_manager_caches_repeated_ground_truth_parse(self):
+        _parse_golden_answer_cached.cache_clear()
+        tokenizer = FakeTokenizer({1: "answer", 101: "prompt"})
+        data = FakeDataProto(
+            responses=[[1], [1]],
+            uids=["g1", "g1"],
+            reward_models=[{"ground_truth": "42"}, {"ground_truth": "42"}],
+            data_sources=["math", "math"],
+        )
+        manager = AERRewardManager(tokenizer=tokenizer, similarity_algorithm="token_match")
+        parse_inputs = []
+
+        def fake_parse(text):
+            parse_inputs.append(text)
+            if text.startswith("\\boxed{"):
+                return ["gold"]
+            return ["pred"]
+
+        with patch("recipe.aer.src.reward_manager.parse", side_effect=fake_parse), patch(
+            "recipe.aer.src.reward_manager.verify",
+            return_value=True,
+        ):
+            result = manager(data, num_examine=0)
+
+        self.assertEqual(parse_inputs.count("\\boxed{42}"), 1)
+        self.assertEqual(parse_inputs.count("answer"), 2)
+        self.assertAlmostEqual(result["reward_tensor_acc"].sum().item(), 2.0, places=6)
+        _parse_golden_answer_cached.cache_clear()
+
+    def test_extra_exploration_metrics_return_scalar_values(self):
+        tokenizer = FakeTokenizer({1: "a", 101: "prompt"})
+        data = FakeDataProto(
+            responses=[[1], [1]],
+            uids=["g1", "g1"],
+            reward_models=[{"ground_truth": "42"}, {"ground_truth": "42"}],
+            data_sources=["math", "math"],
+        )
+        manager = AERRewardManager(
+            tokenizer=tokenizer,
+            similarity_algorithm="token_match",
+            exploration_metric_algorithms=["token_match"],
+        )
+
+        _parse_golden_answer_cached.cache_clear()
+        with patch("recipe.aer.src.reward_manager.parse", return_value=["x"]), patch(
+            "recipe.aer.src.reward_manager.verify",
+            return_value=True,
+        ):
+            result = manager(data, num_examine=0)
+
+        self.assertEqual(result["reward_exploration_metrics_by_algorithm"], {"token_match": 0.5})
+        self.assertNotIn("reward_tensors_exploration_by_algorithm", result)
+        _parse_golden_answer_cached.cache_clear()
+
+    def test_aer_reward_manager_handles_single_training_similarity_without_extra_metrics(self):
+        tokenizer = FakeTokenizer({1: "a", 101: "prompt"})
+        data = FakeDataProto(
+            responses=[[1], [1]],
+            uids=["g1", "g1"],
+            reward_models=[{"ground_truth": "42"}, {"ground_truth": "42"}],
+            data_sources=["math", "math"],
+        )
+        manager = AERRewardManager(
+            tokenizer=tokenizer,
+            similarity_algorithm="token_match",
+            exploration_metric_algorithms=[],
+        )
+
+        _parse_golden_answer_cached.cache_clear()
+        with patch("recipe.aer.src.reward_manager.parse", return_value=["x"]), patch(
+            "recipe.aer.src.reward_manager.verify",
+            return_value=True,
+        ):
+            result = manager(data, num_examine=0)
+
+        self.assertEqual(result["reward_exploration_metrics_by_algorithm"], {})
+        self.assertNotIn("reward_tensors_exploration_by_algorithm", result)
+        self.assertAlmostEqual(result["reward_tensor_exploration"].sum().item(), 1.0, places=6)
+        _parse_golden_answer_cached.cache_clear()
+
+    def test_aer_reward_manager_preserves_compute_score_override(self):
+        tokenizer = FakeTokenizer({1: "a", 101: "prompt"})
+        data = FakeDataProto(
+            responses=[[1], [1]],
+            uids=["g1", "g1"],
+            reward_models=[{"ground_truth": "42"}, {"ground_truth": "42"}],
+            data_sources=["math", "math"],
+        )
+        manager = AERRewardManager(tokenizer=tokenizer, similarity_algorithm="token_match")
+        score_calls = []
+
+        def fake_compute_score(data_source, solution, ground_truth):
+            score_calls.append((data_source, solution, ground_truth))
+            return {"score": 0.25, "acc": 0.25, "pred": "patched"}
+
+        with patch("recipe.aer.src.reward_manager.compute_score", side_effect=fake_compute_score):
+            result = manager(data, num_examine=0)
+
+        self.assertEqual(len(score_calls), 2)
+        self.assertAlmostEqual(result["reward_tensor_acc"].sum().item(), 0.5, places=6)
+        self.assertEqual(result["reward_extra_info"]["pred"], ["patched", "patched"])
+
+    def test_similarity_preprocessing_cache_reuses_decoded_responses(self):
+        tokenizer = FakeTokenizer({1: "a", 2: "b", 101: "prompt"})
+        decode_calls = []
+        original_decode = tokenizer.decode
+
+        def counting_decode(token_ids, skip_special_tokens=True):
+            decode_calls.append(tuple(int(token_id) for token_id in token_ids))
+            return original_decode(token_ids, skip_special_tokens=skip_special_tokens)
+
+        tokenizer.decode = counting_decode
+        data = FakeDataProto(
+            responses=[[1, 2], [1, 2]],
+            uids=["g1", "g1"],
+            reward_models=[{"ground_truth": "42"}, {"ground_truth": "42"}],
+            data_sources=["math", "math"],
+        )
+        data.non_tensor_batch["id"] = ["p1", "p1"]
+        manager = AERRewardManager(
+            tokenizer=tokenizer,
+            similarity_algorithm="token_match",
+            exploration_metric_algorithms=["char_ngram", "rouge_l"],
+        )
+
+        _parse_golden_answer_cached.cache_clear()
+        with patch("recipe.aer.src.reward_manager.parse", return_value=["x"]), patch(
+            "recipe.aer.src.reward_manager.verify",
+            return_value=True,
+        ):
+            manager(data, num_examine=0)
+
+        self.assertEqual(decode_calls.count((1, 2)), 1)
+        self.assertNotIn("_aer_similarity_cache", data.meta_info)
+        _parse_golden_answer_cached.cache_clear()
 
 
 if __name__ == "__main__":

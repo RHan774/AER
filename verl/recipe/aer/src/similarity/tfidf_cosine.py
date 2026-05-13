@@ -83,9 +83,16 @@ class TFIDFCosineSimilarity(BatchSimilarityComputer):
             ngram_range=self.ngram_range,
         )
         tfidf_matrix = vectorizer.fit_transform(texts)
-        cosine_sim = cosine_similarity(tfidf_matrix)
-        similarity_matrix = torch.as_tensor(cosine_sim, device=device, dtype=torch.float32)
-        return self._apply_group_mask(similarity_matrix, self._get_group_mask(data, device))
+        similarity_matrix = torch.zeros((len(texts), len(texts)), device=device, dtype=torch.float32)
+
+        for group in self._get_group_indices(data):
+            group_tfidf = tfidf_matrix[group]
+            group_cosine = cosine_similarity(group_tfidf)
+            group_index = torch.as_tensor(group, device=device, dtype=torch.long)
+            group_tensor = torch.as_tensor(group_cosine, device=device, dtype=torch.float32)
+            similarity_matrix[group_index.unsqueeze(1), group_index.unsqueeze(0)] = group_tensor
+
+        return similarity_matrix
 
     def compute(self, data: DataProto, tokenizer=None) -> torch.Tensor:
         texts = self._decode_responses(data, tokenizer)

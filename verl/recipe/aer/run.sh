@@ -9,7 +9,10 @@ tau=0
 entropy_coeff=0.0
 # 训练兼容字段，tau=0 时不会影响实际 reward；探索奖励指标由 exploration_metric_algorithms 控制。
 similarity_algorithm="token_match"
-exploration_metric_algorithms="[token_match,ngram_overlap,char_ngram,levenshtein,tfidf_cosine,semantic_embedding,simhash,compression_ratio,rouge_l]"
+exploration_metric_algorithms="[token_match,ngram_overlap,semantic_embedding,simhash]"
+# 只把耗时较大的额外指标放到最后 10% 训练步计算；主训练奖励算法不受影响。
+exploration_metric_delayed_algorithms="[simhash,semantic_embedding]"
+exploration_metric_delay_fraction=0.10
 similarity_n=3
 resume_mode="auto" # auto;resume_path;disable
 resume_from_path=""
@@ -17,14 +20,14 @@ resume_from_path=""
 train_batch_size=128
 ppo_mini_batch_size=32
 # bs=128 后不能继续假设 300~400 step 收敛；先用 naive GRPO 做收敛扫描。
-total_training_steps=640
+total_training_steps=504
 # 每 24 step 保存一次，和 test_freq=12 配合，可保留每两个验证点一个可恢复 checkpoint。
-save_freq=24
-test_freq=24
+save_freq=36
+test_freq=36
 experiment_name="baseline-naive-grpo-tau${tau}-all-similarity-metrics"
 # experiment_name="baseline-entropy_coeff${entropy_coeff}"
-max_actor_ckpt_to_keep=6
-max_critic_ckpt_to_keep=6
+max_actor_ckpt_to_keep=8
+max_critic_ckpt_to_keep=8
 
 # modify: 原来是1，改为到16
 val_kwargs_n=16
@@ -96,9 +99,9 @@ reward_manager="aer"
 #      all-MiniLM-L6-v2 (最快，256 token 限制), all-mpnet-base-v2 (512 token 限制)
 similarity_model="/data/models/Qwen/Qwen3-Embedding-0.6B"
 # GPU 上 Qwen3-Embedding-0.6B 仍只编码 response 尾部 1024 token，控制显存和耗时。
-similarity_batch_size=16
-similarity_max_length=1024
-similarity_tail_tokens=1024
+similarity_batch_size=32
+similarity_max_length=4096
+similarity_tail_tokens=4096
 # add: 语义嵌入使用训练外的物理 GPU。训练用 0,1,2,3，embedding worker 用 4,5,6,7。
 similarity_device="cuda"
 similarity_cuda_visible_devices="[4,5,6,7]"
@@ -200,6 +203,8 @@ nohup /data/ruanruihan/.conda/envs/aer/bin/python -m recipe.aer.src.main_ppo \
     algorithm.tau=${tau} \
     algorithm.similarity_algorithm=${similarity_algorithm} \
     algorithm.exploration_metric_algorithms="${exploration_metric_algorithms}" \
+    algorithm.exploration_metric_delayed_algorithms="${exploration_metric_delayed_algorithms}" \
+    algorithm.exploration_metric_delay_fraction=${exploration_metric_delay_fraction} \
     algorithm.similarity_params.n=${similarity_n} \
     algorithm.similarity_params.model_name=${similarity_model} \
     algorithm.similarity_params.batch_size=${similarity_batch_size} \
