@@ -21,6 +21,8 @@
 
 运行中的单实验可用同一个脚本加 `stop` 停止，例如 `bash need_to_modify/train_experiment_scripts/03_gamma_search_ngram_overlap_g1p2.sh stop`。停止逻辑优先停止独立进程组，兜底递归停止 pid 树。
 
+`need_to_modify/run_serial_aer_360.sh` 用于临时串行运行任意 AER 训练实验。脚本开头用 `SERIAL_AER_EXPERIMENTS` 显式设置队列，格式为 `实验名|相似度算法|tau`；所有实验统一训练 `360` step，且 `SAVE_FREQ=TEST_FREQ`，每个验证步都会保存 checkpoint 并同步启动不占 GPU 的 CPU 评测。单个实验结束后，脚本会选择训练日志中 `val-core/*/{acc|reward}/mean@16` 跨验证集均值最高的 checkpoint 做正式 GPU 全量评测，再继续下一个实验。
+
 | 脚本 | 用途 |
 |---|---|
 | `00_baseline_naive_calib.sh` | T0 tau 校准，训练结束后生成 tau 表 |

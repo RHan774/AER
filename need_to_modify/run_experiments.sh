@@ -351,7 +351,7 @@ ray_cpu_override_arg() {
   fi
 }
 
-# 后台 watcher：训练期间轮询 validation 目录，每发现新 JSONL 就立即评测该步。
+# 后台 watcher：训练期间轮询 validation 目录，每发现新 JSONL 就立刻为该 step 拉起独立 CPU 评测进程。
 EVAL_WATCHER_PID=""
 EVAL_WATCHER_STOP_FILE=""
 
@@ -363,21 +363,40 @@ start_eval_watcher() {
   local output_dir="${EVAL_DIR}/${exp_name}/jsonl"
   local eval_log_file="${EVAL_LOG_DIR}/${exp_name}.log"
   mkdir -p "${input_dir}" "${output_dir}"
+  find "${output_dir}" -maxdepth 2 -type d -name '.running' -exec rm -rf {} + 2>/dev/null || true
 
   EVAL_WATCHER_STOP_FILE="${TMP_DIR}/.eval_watcher_stop_${exp_name}"
   rm -f "${EVAL_WATCHER_STOP_FILE}"
 
   (
     cd "${AER_DIR}"
-    while [[ ! -f "${EVAL_WATCHER_STOP_FILE}" ]]; do
-      local jsonl_file
-      for jsonl_file in "${input_dir}"/*.jsonl; do
-        [[ -f "${jsonl_file}" ]] || continue
-        local step_name
-        step_name="$(basename "${jsonl_file}" .jsonl)"
-        local step_output_dir="${output_dir}/${step_name}"
-        [[ -s "${step_output_dir}/validation_summary.csv" ]] && continue
-        log "[watcher] 评测 ${exp_name} step ${step_name}"
+    watcher_eval_pids=()
+
+    launch_step_eval() {
+      local jsonl_file="$1"
+      local final_scan="${2:-0}"
+      local step_name
+      local step_output_dir
+      local lock_dir
+
+      [[ -f "${jsonl_file}" ]] || return 0
+      step_name="$(basename "${jsonl_file}" .jsonl)"
+      step_output_dir="${output_dir}/${step_name}"
+      lock_dir="${step_output_dir}/.running"
+      [[ -s "${step_output_dir}/validation_summary.csv" ]] && return 0
+      mkdir -p "${step_output_dir}"
+      if ! mkdir "${lock_dir}" 2>/dev/null; then
+        return 0
+      fi
+
+      if bool_is_true "${final_scan}"; then
+        log "[watcher] 最终发现 ${exp_name} step ${step_name}，后台启动 CPU 评测"
+      else
+        log "[watcher] 发现 ${exp_name} step ${step_name}，后台启动 CPU 评测"
+      fi
+      (
+        cd "${AER_DIR}"
+        export CUDA_VISIBLE_DEVICES=""
         python eval/eval_from_jsonl.py \
           --input "${jsonl_file}" \
           --output-dir "${step_output_dir}" \
@@ -387,27 +406,32 @@ start_eval_watcher() {
           --semantic-device "${AFTER_TRAIN_EVAL_SEMANTIC_DEVICE:-cpu}" \
           --semantic-batch-size "${AFTER_TRAIN_EVAL_SEMANTIC_BATCH_SIZE:-32}" \
           --semantic-max-length "${AFTER_TRAIN_EVAL_SEMANTIC_MAX_LENGTH:-1024}" || true
+        rm -rf "${lock_dir}"
+      ) &
+      watcher_eval_pids+=("$!")
+    }
+
+    scan_validation_jsonl() {
+      local final_scan="${1:-0}"
+      local jsonl_file
+      for jsonl_file in "${input_dir}"/*.jsonl; do
+        launch_step_eval "${jsonl_file}" "${final_scan}"
       done
+    }
+
+    while [[ ! -f "${EVAL_WATCHER_STOP_FILE}" ]]; do
+      scan_validation_jsonl 0
       sleep 30
     done
     # 停止信号后做最后一轮扫描
-    for jsonl_file in "${input_dir}"/*.jsonl; do
-      [[ -f "${jsonl_file}" ]] || continue
-      local step_name
-      step_name="$(basename "${jsonl_file}" .jsonl)"
-      local step_output_dir="${output_dir}/${step_name}"
-      [[ -s "${step_output_dir}/validation_summary.csv" ]] && continue
-      log "[watcher] 最终评测 ${exp_name} step ${step_name}"
-      python eval/eval_from_jsonl.py \
-        --input "${jsonl_file}" \
-        --output-dir "${step_output_dir}" \
-        --metrics "${AFTER_TRAIN_EVAL_METRICS}" \
-        --ks "${AFTER_TRAIN_EVAL_KS}" \
-        --semantic-model "${EMBEDDING_MODEL_PATH}" \
-        --semantic-device "${AFTER_TRAIN_EVAL_SEMANTIC_DEVICE:-cpu}" \
-        --semantic-batch-size "${AFTER_TRAIN_EVAL_SEMANTIC_BATCH_SIZE:-32}" \
-        --semantic-max-length "${AFTER_TRAIN_EVAL_SEMANTIC_MAX_LENGTH:-1024}" || true
-    done
+    scan_validation_jsonl 1
+    if [[ "${#watcher_eval_pids[@]}" -gt 0 ]]; then
+      log "[watcher] 等待 ${#watcher_eval_pids[@]} 个 step CPU 评测进程结束"
+      local eval_pid
+      for eval_pid in "${watcher_eval_pids[@]}"; do
+        wait "${eval_pid}" 2>/dev/null || true
+      done
+    fi
   ) >> "${eval_log_file}" 2>&1 &
   EVAL_WATCHER_PID="$!"
   EVAL_BG_PIDS+=("${EVAL_WATCHER_PID}")

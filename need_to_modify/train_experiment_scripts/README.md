@@ -2,6 +2,8 @@
 
 这个目录中的脚本用于单独运行一个训练实验。每个脚本都会调用 `../run_experiments.sh` 中的完整训练逻辑，并包含训练期间每个 validation step 的 CPU watcher 评测。
 
+watcher 会在每个 validation JSONL 生成后立刻启动一个独立的 CPU 评测进程；它不会等整个训练实验结束后才统一评测，也不会占用 GPU。
+
 推荐顺序：
 
 1. `00_baseline_naive_calib.sh`：生成 tau 表。

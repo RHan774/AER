@@ -70,6 +70,23 @@ bash need_to_modify/formal_eval_scripts/06_eval_gamma_search_best.sh
 bash need_to_modify/formal_eval_scripts/09_eval_aer_semantic_embedding_best_gamma.sh
 ```
 
+如果要串行运行一组临时指定的 AER 训练实验，可以编辑 `need_to_modify/run_serial_aer_360.sh` 开头的 `SERIAL_AER_EXPERIMENTS`：
+
+```bash
+SERIAL_AER_EXPERIMENTS=(
+  "aer-token_match-custom-tau0p120-s360|token_match|0.120"
+  "aer-ngram_overlap-custom-tau0p080-s360|ngram_overlap|0.080"
+)
+```
+
+然后运行：
+
+```bash
+bash need_to_modify/run_serial_aer_360.sh
+```
+
+这个脚本会把每个实验统一训练到 `360` step，并让 `SAVE_FREQ=TEST_FREQ`，保证每个验证步都有 checkpoint。每个实验训练时仍会同步启动不占 GPU 的 step 级 CPU 评测；训练结束后会从训练日志中选择 `val-core/*/{acc|reward}/mean@16` 跨验证集均值最高的 checkpoint，立刻对该 checkpoint 做包含 GPU 推理的正式全量评测，然后再进入下一个实验。
+
 常用覆盖方式：
 
 ```bash
@@ -83,6 +100,7 @@ FORMAL_EVAL_CHECKPOINT_STEP=504 bash need_to_modify/formal_eval_scripts/07_eval_
 ```bash
 bash need_to_modify/train_experiment_scripts/03_gamma_search_ngram_overlap_g1p2.sh stop
 bash need_to_modify/formal_eval_scripts/09_eval_aer_semantic_embedding_best_gamma.sh stop
+bash need_to_modify/run_serial_aer_360.sh stop
 ```
 
 ## 4. 训练队列
@@ -134,7 +152,7 @@ SIMILARITY_CUDA_VISIBLE_DEVICES="[4,5,6,7]"
 SIMILARITY_NUM_PROCESSES=4
 ```
 
-训练期间后台 watcher 实时评测每一步 validation JSONL（纯 CPU，与训练并行不占 GPU）：
+训练期间后台 watcher 实时评测每一步 validation JSONL（纯 CPU，与训练并行不占 GPU）。每发现一个新的 validation JSONL，watcher 都会为该 step 单独启动一个后台 CPU 评测进程，后续 step 不需要等待前一个 step 评测完成：
 
 ```bash
 AFTER_TRAIN_EVAL_METRICS="pass@k,first@1,distinct-2,self-bleu,equational-diversity"
@@ -179,6 +197,7 @@ FORMAL_EVAL_INCLUDE_GAMMA_SEARCH=0
 | `save/eval/gamma_best_<algorithm>.env` | 自动选择出的最佳 gamma |
 | `save/eval/<exp>/train_log/` | 训练日志导出的指标 |
 | `save/eval/<exp>/jsonl/<step>/` | 训练期间实时 CPU 评测（每步一个子目录） |
+| `save/eval/<exp>/best_step_mean16.env` | `run_serial_aer_360.sh` 选择出的最佳 checkpoint 信息 |
 | `save/eval/<exp>/<FORMAL_EVAL_OUTPUT_SUBDIR>/` | 正式完整评测 |
 | `save/run/train_logs/<exp>.log` | 每个训练实验 stdout/stderr |
 | `save/run/eval_logs/<exp>.log` | 训练期间后台评测 watcher 日志 |
@@ -186,5 +205,6 @@ FORMAL_EVAL_INCLUDE_GAMMA_SEARCH=0
 | `need_to_modify/eval_logs/<timestamp>/` | 正式完整评测主日志、合并日志、推理日志和指标日志 |
 | `need_to_modify/train_experiment_scripts/` | 每个训练实验的独立入口 |
 | `need_to_modify/formal_eval_scripts/` | 每个正式评测实验的独立入口 |
+| `need_to_modify/run_serial_aer_360.sh` | 串行运行任意 AER 训练实验，并自动评测最佳 checkpoint |
 
 中断后重新执行同一命令即可；已完成实验由 `save/run/state/<exp>.done` 跳过，未完成实验使用 `trainer.resume_mode=auto` 续跑。
