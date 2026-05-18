@@ -7,8 +7,10 @@ set -euo pipefail
 # 注意：实验名会直接用于 save/checkpoints/<实验名> 和 save/validation/<实验名>。
 ###############################################################################
 SERIAL_AER_EXPERIMENTS=(
-  # "aer-token_match-custom-tau0p120-s360|token_match|0.120"
-  # "aer-ngram_overlap-custom-tau0p080-s360|ngram_overlap|0.080"
+  "token_match-tau0p426176-s360|token_match|0.426176"
+  "ngram_overlap-tau0p264776-s360|ngram_overlap|0.264776"
+  "ngram_overlap-tau0p356872-s360|ngram_overlap|0.356872"
+  "ngram_overlap-tau0p448968-s360|ngram_overlap|0.448968"
   # "aer-semantic_embedding-custom-tau0p050-s360|semantic_embedding|0.050"
 )
 
@@ -22,6 +24,7 @@ SERIAL_MAX_CKPTS_TO_KEEP="${SERIAL_MAX_CKPTS_TO_KEEP:-0}"
 
 # 最佳 checkpoint 选择：对所有 val-core/*/{acc|reward}/mean@16 取均值，均值最高者胜出。
 SERIAL_BEST_K="${SERIAL_BEST_K:-16}"
+SERIAL_BEST_CKPTS_TO_KEEP="${SERIAL_BEST_CKPTS_TO_KEEP:-3}"
 
 # 全量评测输出子目录前缀；最终目录会自动附加 step 和 config.env 中的 FORMAL_EVAL_OUTPUT_SUBDIR。
 SERIAL_FORMAL_OUTPUT_SUBDIR_PREFIX="${SERIAL_FORMAL_OUTPUT_SUBDIR_PREFIX:-formal_best}"
@@ -123,7 +126,7 @@ select_best_checkpoint_step() {
   [[ -s "${metrics_csv}" ]] || die "缺少训练指标 CSV，无法选择最佳 step: ${metrics_csv}"
 
   mkdir -p "$(dirname "${best_env}")"
-  python - "${metrics_csv}" "${ckpt_dir}" "${SERIAL_BEST_K}" "${best_env}" <<'PY'
+  python - "${metrics_csv}" "${ckpt_dir}" "${SERIAL_BEST_K}" "${best_env}" "${SERIAL_BEST_CKPTS_TO_KEEP}" <<'PY'
 import csv
 import math
 import re
@@ -131,8 +134,11 @@ import shlex
 import sys
 from pathlib import Path
 
-metrics_csv, ckpt_dir, raw_k, best_env = sys.argv[1:]
+metrics_csv, ckpt_dir, raw_k, best_env, raw_keep_count = sys.argv[1:]
 k = str(int(raw_k))
+keep_count = int(raw_keep_count)
+if keep_count < 1:
+    raise SystemExit(f"SERIAL_BEST_CKPTS_TO_KEEP 必须大于等于 1，当前值: {keep_count}")
 ckpt_dir = Path(ckpt_dir)
 
 
@@ -160,7 +166,7 @@ mean_cols = [name for name in fieldnames if mean_pattern.match(name)]
 if not mean_cols:
     raise SystemExit(f"{metrics_csv} 缺少 val-core/*/{{acc|reward}}/mean@{k} 列；请确认 VAL_KWARGS_N={k}")
 
-best = None
+candidates = []
 for row in rows:
     step_value = to_float(row.get("step"))
     if step_value is None:
@@ -177,19 +183,20 @@ for row in rows:
 
     mean16 = sum(mean_values) / len(mean_values)
     score = mean16
-    candidate = (score, step, mean16, len(mean_values))
-    if best is None or (candidate[0], candidate[1]) > (best[0], best[1]):
-        best = candidate
+    candidates.append((score, step, mean16, len(mean_values)))
 
-if best is None:
+if not candidates:
     raise SystemExit(f"{metrics_csv} 中没有同时具备 checkpoint 和 val-core/*/{{acc|reward}}/mean@{k} 的 step")
 
-score, step, mean16, mean_count = best
+candidates.sort(key=lambda candidate: (candidate[0], candidate[1]), reverse=True)
+score, step, mean16, mean_count = candidates[0]
+top_steps = [str(candidate[1]) for candidate in candidates[:keep_count]]
 env_lines = {
     "BEST_STEP": str(step),
     "BEST_SCORE": f"{score:.12g}",
     "BEST_MEAN16": f"{mean16:.12g}",
     "BEST_MEAN_COLUMN_COUNT": str(mean_count),
+    "BEST_TOP_STEPS": " ".join(top_steps),
 }
 with open(best_env, "w", encoding="utf-8") as f:
     for key, value in env_lines.items():
@@ -198,7 +205,44 @@ print(step)
 PY
   # shellcheck source=/dev/null
   source "${best_env}"
-  log "最佳 checkpoint: ${exp_name} step=${BEST_STEP}, val-core mean@${SERIAL_BEST_K}=${BEST_MEAN16}, score=${BEST_SCORE}"
+  log "最佳 checkpoint: ${exp_name} step=${BEST_STEP}, val-core mean@${SERIAL_BEST_K}=${BEST_MEAN16}, score=${BEST_SCORE}, 保留前${SERIAL_BEST_CKPTS_TO_KEEP}=${BEST_TOP_STEPS}"
+}
+
+prune_checkpoints_to_best_steps() {
+  local exp_name="$1"
+  local keep_steps="$2"
+  local ckpt_dir="${SAVE_DIR}/checkpoints/${exp_name}"
+
+  [[ -d "${ckpt_dir}" ]] || die "checkpoint 目录不存在，无法清理: ${ckpt_dir}"
+  [[ -n "${keep_steps}" ]] || die "缺少要保留的最佳 checkpoint step 列表: ${exp_name}"
+
+  local -A keep_step_set=()
+  local step
+  for step in ${keep_steps}; do
+    [[ "${step}" =~ ^[0-9]+$ ]] || die "非法 checkpoint step: ${step}"
+    keep_step_set["${step}"]=1
+  done
+
+  local removed_count=0
+  local kept_count=0
+  local ckpt_path
+  local ckpt_name
+  for ckpt_path in "${ckpt_dir}"/global_step_*; do
+    [[ -d "${ckpt_path}" ]] || continue
+    ckpt_name="$(basename "${ckpt_path}")"
+    [[ "${ckpt_name}" =~ ^global_step_([0-9]+)$ ]] || continue
+    step="${BASH_REMATCH[1]}"
+
+    if [[ -n "${keep_step_set[${step}]:-}" ]]; then
+      kept_count=$((kept_count + 1))
+      continue
+    fi
+
+    rm -rf -- "${ckpt_path}"
+    removed_count=$((removed_count + 1))
+  done
+
+  log "checkpoint 清理完成: ${exp_name}, 保留=${kept_count}(${keep_steps}), 删除=${removed_count}, 目录=${ckpt_dir}"
 }
 
 write_formal_eval_config() {
@@ -282,6 +326,7 @@ run_serial_experiment() {
   fi
 
   select_best_checkpoint_step "${exp_name}"
+  prune_checkpoints_to_best_steps "${exp_name}" "${BEST_TOP_STEPS}"
   run_formal_eval_for_best_step "${exp_name}" "${BEST_STEP}"
 }
 
@@ -302,7 +347,7 @@ main() {
   prepare_dirs
   apply_network_env
 
-  log "串行 AER 训练配置: steps=${TOTAL_TRAINING_STEPS}, test_freq=${TEST_FREQ}, save_freq=${SAVE_FREQ}, max_ckpts=${MAX_ACTOR_CKPT_TO_KEEP}"
+  log "串行 AER 训练配置: steps=${TOTAL_TRAINING_STEPS}, test_freq=${TEST_FREQ}, save_freq=${SAVE_FREQ}, max_ckpts=${MAX_ACTOR_CKPT_TO_KEEP}, best_ckpts_to_keep=${SERIAL_BEST_CKPTS_TO_KEEP}"
   log "训练期间 CPU 评测指标: metrics=${AFTER_TRAIN_EVAL_METRICS}, ks=${AFTER_TRAIN_EVAL_KS}, semantic_device=${AFTER_TRAIN_EVAL_SEMANTIC_DEVICE:-cpu}"
 
   local spec

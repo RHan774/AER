@@ -46,7 +46,7 @@ truncation="right"
 
 # actor_rollout_ref
 # model
-model_path="/data/models/Qwen/Qwen3-4B"
+model_path="/data/models/Qwen/Qwen3-4B-Base"
 enable_gradient_checkpointing=True
 use_remove_padding=True
 # actor

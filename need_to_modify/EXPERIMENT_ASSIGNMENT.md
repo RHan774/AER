@@ -48,7 +48,7 @@
 | 项目 | 说明 |
 |---|---|
 | `WANDB_API_KEY` | 不应提交到 Git，本地填写或把 `WANDB_MODE` 改成 `offline/disabled` |
-| `MODEL_PATH` | 默认 `/data/models/Qwen/Qwen3-4B`，按服务器实际路径修改 |
+| `MODEL_PATH` | 默认 `/data/models/Qwen/Qwen3-4B-Base`，按服务器实际路径修改 |
 | `EMBEDDING_MODEL_PATH` | semantic embedding 训练和 semantic-cosine 评测需要 |
 | `SIMILARITY_*` | 控制 semantic_embedding 使用 CPU、单 GPU 或多 GPU |
 | `CALIBRATION_DELAYED_ALGORITHMS` | 默认 `semantic_embedding`，T0 中延后到最后 10% 步才记录的耗时算法 |

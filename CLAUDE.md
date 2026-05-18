@@ -66,7 +66,7 @@ trainer.resume_from_path="<checkpoint_path>"
 
 | Parameter | Description |
 |-----------|-------------|
-| `model_path` | Path to base model (e.g., `/data/models/Qwen/Qwen3-4B`) |
+| `model_path` | Path to base model (e.g., `/data/models/Qwen/Qwen3-4B-Base`) |
 | `tau` | Target exploration reward level (affects dynamic weighting) |
 | `rollout_n` | Number of responses per prompt for diversity computation (default: 16) |
 | `train_batch_size` | Training batch size |
