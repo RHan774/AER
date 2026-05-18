@@ -717,4 +717,6 @@ main() {
   log "所有正式实验第 ${EVAL_CHECKPOINT_STEP} 步 checkpoint 的重推理评估已完成。主日志: ${MASTER_LOG}"
 }
 
-main "$@"
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+  main "$@"
+fi
