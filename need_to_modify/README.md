@@ -29,12 +29,17 @@ bash need_to_modify/run_experiments.sh assets
 bash need_to_modify/run_experiments.sh test
 ```
 
-### 1.3 运行实验
+### 3. 运行实验
 ```bash
-bash need_to_modify/run_serial_aer_360.sh
+nohup bash need_to_modify/run_serial_aer_360.sh > master.log 2>&1 &
 ```
 
-### 1.4 终止实验
+### 4. 查看实验进展
+```bash
+tail -f master.log
+```
+
+### 5. 终止实验
 ```bash
 bash need_to_modify/run_serial_aer_360.sh stop
 ```
