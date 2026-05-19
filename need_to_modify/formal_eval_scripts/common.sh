@@ -10,7 +10,8 @@ export AER_CONFIG="${AER_CONFIG:-${NEED_TO_MODIFY_DIR}/config.env}"
 source "${NEED_TO_MODIFY_DIR}/script_process_control.sh"
 
 AER_SINGLE_SCRIPT_OVERRIDE_NAMES=(
-  SAVE_DIR
+  DATA_DIR
+  INFERENCE_CKPT_DIR
   WANDB_MODE
   WANDB_PROJECT
   WANDB_ENTITY
@@ -79,6 +80,8 @@ trap 'single_formal_signal_exit 130' INT
 trap 'single_formal_signal_exit 143' TERM
 
 refresh_formal_paths() {
+  DATA_DIR="${DATA_DIR:-${REPO_ROOT}/save/data}"
+  INFERENCE_CKPT_DIR="${INFERENCE_CKPT_DIR:-${SAVE_DIR}/inference_checkpoints}"
   EVAL_DIR="${SAVE_DIR}/eval"
 }
 
@@ -111,10 +114,10 @@ init_single_formal_eval() {
   EVAL_FORCE_MERGE="${FORMAL_EVAL_FORCE_MERGE:-${EVAL_FORCE_MERGE:-0}}"
 
   VAL_FILES=(
-    "${SAVE_DIR}/data/math-ai/math500/test_repeated.parquet"
-    "${SAVE_DIR}/data/math-ai/amc23/test_repeated.parquet"
-    "${SAVE_DIR}/data/math-ai/aime24/test_repeated.parquet"
-    "${SAVE_DIR}/data/math-ai/aime25/test_repeated.parquet"
+    "${DATA_DIR}/math-ai/math500/test_repeated.parquet"
+    "${DATA_DIR}/math-ai/amc23/test_repeated.parquet"
+    "${DATA_DIR}/math-ai/aime24/test_repeated.parquet"
+    "${DATA_DIR}/math-ai/aime25/test_repeated.parquet"
   )
 
   activate_conda

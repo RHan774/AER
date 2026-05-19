@@ -15,6 +15,8 @@ fi
 
 AER_DIR="${REPO_ROOT}/verl/recipe/aer"
 VERL_DIR="${REPO_ROOT}/verl"
+DATA_DIR="${DATA_DIR:-${REPO_ROOT}/save/data}"
+INFERENCE_CKPT_DIR="${INFERENCE_CKPT_DIR:-${SAVE_DIR}/inference_checkpoints}"
 STATE_DIR="${SAVE_DIR}/run/state"
 LOG_DIR="${SAVE_DIR}/run/train_logs"
 EVAL_LOG_DIR="${SAVE_DIR}/run/eval_logs"
@@ -39,7 +41,7 @@ bool_is_true() {
 
 prepare_dirs() {
   mkdir -p "${SAVE_DIR}" "${STATE_DIR}" "${LOG_DIR}" "${EVAL_LOG_DIR}" "${EVAL_DIR}" "${TMP_DIR}"
-  mkdir -p "${SAVE_DIR}/checkpoints" "${SAVE_DIR}/validation" "${SAVE_DIR}/data" "${SAVE_DIR}/models"
+  mkdir -p "${SAVE_DIR}/checkpoints" "${SAVE_DIR}/validation" "${INFERENCE_CKPT_DIR}" "${DATA_DIR}"
 }
 
 apply_network_env() {
@@ -219,11 +221,11 @@ prepare_one_dataset() {
     return 0
   fi
 
-  mkdir -p "${SAVE_DIR}/data/${source}"
+  mkdir -p "${DATA_DIR}/${source}"
   log "准备数据集 ${source}"
   python "${AER_DIR}/src/data_preparation.py" \
     --data_dir "${DATA_REPO_PREFIX}" \
-    --save_dir "${SAVE_DIR}/data" \
+    --save_dir "${DATA_DIR}" \
     --n_repeat "${DATA_REPEAT}" \
     --data_source "${source}"
 }
@@ -233,11 +235,11 @@ prepare_data() {
   activate_conda
   apply_network_env
 
-  prepare_one_dataset "DigitalLearningGmbH/MATH-lighteval" "${SAVE_DIR}/data/DigitalLearningGmbH/MATH-lighteval/train.parquet"
-  prepare_one_dataset "math-ai/math500" "${SAVE_DIR}/data/math-ai/math500/test_repeated.parquet"
-  prepare_one_dataset "math-ai/amc23" "${SAVE_DIR}/data/math-ai/amc23/test_repeated.parquet"
-  prepare_one_dataset "math-ai/aime24" "${SAVE_DIR}/data/math-ai/aime24/test_repeated.parquet"
-  prepare_one_dataset "math-ai/aime25" "${SAVE_DIR}/data/math-ai/aime25/test_repeated.parquet"
+  prepare_one_dataset "DigitalLearningGmbH/MATH-lighteval" "${DATA_DIR}/DigitalLearningGmbH/MATH-lighteval/train.parquet"
+  prepare_one_dataset "math-ai/math500" "${DATA_DIR}/math-ai/math500/test_repeated.parquet"
+  prepare_one_dataset "math-ai/amc23" "${DATA_DIR}/math-ai/amc23/test_repeated.parquet"
+  prepare_one_dataset "math-ai/aime24" "${DATA_DIR}/math-ai/aime24/test_repeated.parquet"
+  prepare_one_dataset "math-ai/aime25" "${DATA_DIR}/math-ai/aime25/test_repeated.parquet"
 }
 
 run_smoke_tests() {
@@ -289,10 +291,10 @@ metric_list_contains() {
 
 val_files_override() {
   printf "['%s','%s','%s','%s']" \
-    "${SAVE_DIR}/data/math-ai/math500/test_repeated.parquet" \
-    "${SAVE_DIR}/data/math-ai/amc23/test_repeated.parquet" \
-    "${SAVE_DIR}/data/math-ai/aime24/test_repeated.parquet" \
-    "${SAVE_DIR}/data/math-ai/aime25/test_repeated.parquet"
+    "${DATA_DIR}/math-ai/math500/test_repeated.parquet" \
+    "${DATA_DIR}/math-ai/amc23/test_repeated.parquet" \
+    "${DATA_DIR}/math-ai/aime24/test_repeated.parquet" \
+    "${DATA_DIR}/math-ai/aime25/test_repeated.parquet"
 }
 
 tau_tag() {
@@ -480,7 +482,7 @@ run_experiment() {
     python -m recipe.aer.src.main_ppo
     "trainer.resume_mode=auto"
     "trainer.resume_from_path=''"
-    "data.train_files='${SAVE_DIR}/data/DigitalLearningGmbH/MATH-lighteval/train.parquet'"
+    "data.train_files='${DATA_DIR}/DigitalLearningGmbH/MATH-lighteval/train.parquet'"
     "data.val_files=${val_files}"
     "data.max_prompt_length=${MAX_PROMPT_LENGTH}"
     "data.max_response_length=${MAX_RESPONSE_LENGTH}"
@@ -502,6 +504,7 @@ run_experiment() {
     "actor_rollout_ref.actor.optim.weight_decay=${WEIGHT_DECAY}"
     "actor_rollout_ref.actor.fsdp_config.param_offload=False"
     "actor_rollout_ref.actor.fsdp_config.optimizer_offload=False"
+    "actor_rollout_ref.actor.checkpoint.contents=[model,optimizer,extra,hf_model]"
     "actor_rollout_ref.rollout.temperature=${TEMPERATURE}"
     "actor_rollout_ref.rollout.top_p=${TOP_P}"
     "actor_rollout_ref.rollout.gpu_memory_utilization=${GPU_MEMORY_UTILIZATION}"
@@ -550,6 +553,7 @@ run_experiment() {
     "trainer.max_actor_ckpt_to_keep=${MAX_ACTOR_CKPT_TO_KEEP}"
     "trainer.max_critic_ckpt_to_keep=${MAX_CRITIC_CKPT_TO_KEEP}"
     "trainer.default_local_dir='${SAVE_DIR}/checkpoints/${exp_name}'"
+    "trainer.inference_checkpoint_dir='${INFERENCE_CKPT_DIR}/${exp_name}'"
   )
 
   if [[ -n "${ray_cpu_arg}" ]]; then
@@ -926,12 +930,31 @@ check_inputs() {
   if [[ "${command}" =~ ^(setup|train|all)$ && "${WANDB_MODE}" == "online" && -z "${WANDB_API_KEY:-}" ]] && ! bool_is_true "${DRY_RUN:-0}"; then
     die "请在 ${CONFIG_FILE} 中填写 WANDB_API_KEY，或把 WANDB_MODE 改成 offline/disabled。"
   fi
+  if [[ "${command}" == "train" ]] && ! bool_is_true "${DRY_RUN:-0}"; then
+    local data_file
+    local missing_data=()
+    for data_file in \
+      "${DATA_DIR}/DigitalLearningGmbH/MATH-lighteval/train.parquet" \
+      "${DATA_DIR}/math-ai/math500/test_repeated.parquet" \
+      "${DATA_DIR}/math-ai/amc23/test_repeated.parquet" \
+      "${DATA_DIR}/math-ai/aime24/test_repeated.parquet" \
+      "${DATA_DIR}/math-ai/aime25/test_repeated.parquet"; do
+      [[ -f "${data_file}" ]] || missing_data+=("${data_file}")
+    done
+    if [[ "${#missing_data[@]}" -ne 0 ]]; then
+      printf '[ERROR] 训练数据缺失，当前 DATA_DIR=%s。请确认 parquet 数据已经放在该目录下：\n' "${DATA_DIR}" >&2
+      printf '  - %s\n' "${missing_data[@]}" >&2
+      exit 1
+    fi
+  fi
 }
 
 print_status() {
   cat <<EOF
 REPO_ROOT=${REPO_ROOT}
 SAVE_DIR=${SAVE_DIR}
+DATA_DIR=${DATA_DIR}
+INFERENCE_CKPT_DIR=${INFERENCE_CKPT_DIR}
 CONFIG_FILE=${CONFIG_FILE}
 CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES}
 RUN_BASELINE_NAIVE=${RUN_BASELINE_NAIVE}

@@ -4,14 +4,12 @@ set -euo pipefail
 ###############################################################################
 # 在这里显式设置要串行运行的 AER 训练实验。
 # 格式: "实验名|相似度算法|tau"
-# 注意：实验名会直接用于 save/checkpoints/<实验名> 和 save/validation/<实验名>。
+# 注意：实验名会直接用于 ${PRIMUS_OUTPUT_DIR}/checkpoints/<实验名> 和 ${PRIMUS_OUTPUT_DIR}/validation/<实验名>。
 ###############################################################################
 SERIAL_AER_EXPERIMENTS=(
-  "token_match-tau0p426176-s360|token_match|0.426176"
-  "ngram_overlap-tau0p264776-s360|ngram_overlap|0.264776"
-  "ngram_overlap-tau0p356872-s360|ngram_overlap|0.356872"
-  "ngram_overlap-tau0p448968-s360|ngram_overlap|0.448968"
-  # "aer-semantic_embedding-custom-tau0p050-s360|semantic_embedding|0.050"
+  "semantic_embedding-tau0p06992832-s360|semantic_embedding|0.06992832"
+  "semantic_embedding-tau0p06743088-s360|semantic_embedding|0.06743088"
+  "simhash-tau0p1845382-s360|simhash|0.1845382"
 )
 
 # 统一训练步数。按需求固定为 360；如确需临时调试，可用环境变量覆盖。
@@ -20,11 +18,10 @@ SERIAL_TRAINING_STEPS="${SERIAL_TRAINING_STEPS:-360}"
 # 每个验证步都保存 checkpoint，这样最佳验证步一定有 checkpoint 可做全量评测。
 SERIAL_TEST_FREQ="${SERIAL_TEST_FREQ:-12}"
 SERIAL_SAVE_FREQ="${SERIAL_SAVE_FREQ:-${SERIAL_TEST_FREQ}}"
-SERIAL_MAX_CKPTS_TO_KEEP="${SERIAL_MAX_CKPTS_TO_KEEP:-0}"
+SERIAL_MAX_CKPTS_TO_KEEP="${SERIAL_MAX_CKPTS_TO_KEEP:-}"
 
 # 最佳 checkpoint 选择：对所有 val-core/*/{acc|reward}/mean@16 取均值，均值最高者胜出。
 SERIAL_BEST_K="${SERIAL_BEST_K:-16}"
-SERIAL_BEST_CKPTS_TO_KEEP="${SERIAL_BEST_CKPTS_TO_KEEP:-3}"
 
 # 全量评测输出子目录前缀；最终目录会自动附加 step 和 config.env 中的 FORMAL_EVAL_OUTPUT_SUBDIR。
 SERIAL_FORMAL_OUTPUT_SUBDIR_PREFIX="${SERIAL_FORMAL_OUTPUT_SUBDIR_PREFIX:-formal_best}"
@@ -32,12 +29,14 @@ SERIAL_FORMAL_OUTPUT_SUBDIR_PREFIX="${SERIAL_FORMAL_OUTPUT_SUBDIR_PREFIX:-formal
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 export AER_CONFIG="${AER_CONFIG:-${SCRIPT_DIR}/config.env}"
+SERIAL_GPU_PROFILE_PREFIX="RUN_1"
 
 # shellcheck source=script_process_control.sh
 source "${SCRIPT_DIR}/script_process_control.sh"
 
 AER_SERIAL_OVERRIDE_NAMES=(
-  SAVE_DIR
+  DATA_DIR
+  INFERENCE_CKPT_DIR
   WANDB_MODE
   WANDB_PROJECT
   WANDB_ENTITY
@@ -73,6 +72,7 @@ AER_SERIAL_OVERRIDE_NAMES=(
   FORMAL_EVAL_TOP_K
   FORMAL_EVAL_SEED
   FORMAL_EVAL_FORCE_MERGE
+  STOP_RAY_BETWEEN_RUNS
   DRY_RUN
   FORCE_RERUN
 )
@@ -83,7 +83,7 @@ aer_single_script_capture_env_overrides "${AER_SERIAL_OVERRIDE_NAMES[@]}"
 source "${SCRIPT_DIR}/run_experiments.sh"
 aer_single_script_restore_env_overrides
 
-# 支持 `bash need_to_modify/run_serial_aer_360.sh stop` 停止当前串行队列及其子进程。
+# 支持 `bash need_to_modify/1_run.sh stop` 停止当前串行队列及其子进程。
 aer_single_script_init "serial_aer_360" "${BASH_SOURCE[0]}" "$@"
 
 serial_cleanup() {
@@ -113,11 +113,97 @@ safe_file_tag() {
   aer_pc_safe_name "$1"
 }
 
+count_csv_items() {
+  local raw="$1"
+  local trimmed="${raw#[}"
+  trimmed="${trimmed%]}"
+
+  local -a items=()
+  local item
+  local count=0
+  IFS=',' read -r -a items <<< "${trimmed}"
+  for item in "${items[@]}"; do
+    item="${item//[[:space:]]/}"
+    if [[ -n "${item}" ]]; then
+      count=$((count + 1))
+    fi
+  done
+  printf '%s' "${count}"
+}
+
+apply_serial_gpu_profile() {
+  local prefix="$1"
+  local name
+  local profile_name
+  local backup_name
+  local value
+
+  for name in CUDA_VISIBLE_DEVICES N_GPUS_PER_NODE SIMILARITY_CUDA_VISIBLE_DEVICES SIMILARITY_NUM_PROCESSES FORMAL_EVAL_GPUS; do
+    backup_name="AER_SINGLE_SCRIPT_ORIGINAL_${name}"
+    if [[ ${!backup_name+x} ]]; then
+      continue
+    fi
+
+    profile_name="${prefix}_${name}"
+    if [[ ${!profile_name+x} ]]; then
+      value="${!profile_name}"
+      if [[ -n "${value}" ]]; then
+        printf -v "${name}" '%s' "${value}"
+        export "${name}"
+      fi
+    fi
+  done
+}
+
+ensure_serial_gpu_config() {
+  local script_label
+  local train_gpu_count
+  local formal_gpus
+  local formal_gpu_count
+  script_label="$(basename "${BASH_SOURCE[0]}")"
+  train_gpu_count="$(count_csv_items "${CUDA_VISIBLE_DEVICES:-}")"
+  formal_gpus="${FORMAL_EVAL_GPUS:-${CUDA_VISIBLE_DEVICES:-}}"
+  formal_gpu_count="$(count_csv_items "${formal_gpus}")"
+
+  if [[ "${train_gpu_count}" -lt 1 ]]; then
+    die "${script_label} 至少需要 1 张训练 GPU，但 CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-<空>} 没有解析到有效 GPU。"
+  fi
+  if [[ "${formal_gpu_count}" -lt 1 ]]; then
+    die "${script_label} 至少需要 1 张正式评测 GPU，但 FORMAL_EVAL_GPUS=${formal_gpus:-<空>} 没有解析到有效 GPU。"
+  fi
+
+  if [[ ! "${N_GPUS_PER_NODE:-}" =~ ^[0-9]+$ ]]; then
+    die "N_GPUS_PER_NODE 必须是整数，当前值: ${N_GPUS_PER_NODE:-<空>}"
+  fi
+  if [[ "${N_GPUS_PER_NODE}" -ne "${train_gpu_count}" ]]; then
+    die "${script_label} 的 N_GPUS_PER_NODE=${N_GPUS_PER_NODE} 与训练 GPU 数 ${train_gpu_count} 不一致；请同步设置 ${SERIAL_GPU_PROFILE_PREFIX}_N_GPUS_PER_NODE=${train_gpu_count}。"
+  fi
+
+  if [[ "${SIMILARITY_DEVICE:-}" == cuda* ]]; then
+    if [[ ! "${SIMILARITY_NUM_PROCESSES:-}" =~ ^[0-9]+$ ]]; then
+      die "SIMILARITY_NUM_PROCESSES 必须是整数，当前值: ${SIMILARITY_NUM_PROCESSES:-<空>}"
+    fi
+
+    if [[ -n "${SIMILARITY_CUDA_VISIBLE_DEVICES:-}" && "${SIMILARITY_CUDA_VISIBLE_DEVICES}" != "null" ]]; then
+      local similarity_gpu_count
+      similarity_gpu_count="$(count_csv_items "${SIMILARITY_CUDA_VISIBLE_DEVICES}")"
+      if [[ "${similarity_gpu_count}" -lt 1 ]]; then
+        die "${script_label} 至少需要 1 张相似度计算 GPU，但 SIMILARITY_CUDA_VISIBLE_DEVICES=${SIMILARITY_CUDA_VISIBLE_DEVICES} 没有解析到有效 GPU。"
+      fi
+      if [[ "${SIMILARITY_NUM_PROCESSES}" -ne "${similarity_gpu_count}" ]]; then
+        die "${script_label} 的 SIMILARITY_NUM_PROCESSES=${SIMILARITY_NUM_PROCESSES} 与相似度 GPU 数 ${similarity_gpu_count} 不一致。"
+      fi
+    elif [[ "${SIMILARITY_NUM_PROCESSES}" -ne "${train_gpu_count}" ]]; then
+      die "${script_label} 未单独设置 SIMILARITY_CUDA_VISIBLE_DEVICES 时，SIMILARITY_NUM_PROCESSES=${SIMILARITY_NUM_PROCESSES} 应与训练 GPU 数 ${train_gpu_count} 一致。"
+    fi
+  fi
+}
+
 select_best_checkpoint_step() {
   local exp_name="$1"
   local metrics_csv="${EVAL_DIR}/${exp_name}/train_log/train_metrics.csv"
   local log_file="${LOG_DIR}/${exp_name}.log"
-  local ckpt_dir="${SAVE_DIR}/checkpoints/${exp_name}"
+  local inference_ckpt_dir="${INFERENCE_CKPT_DIR}/${exp_name}"
   local best_env="${EVAL_DIR}/${exp_name}/best_step_mean${SERIAL_BEST_K}.env"
 
   if [[ ! -s "${metrics_csv}" && -s "${log_file}" ]]; then
@@ -126,7 +212,7 @@ select_best_checkpoint_step() {
   [[ -s "${metrics_csv}" ]] || die "缺少训练指标 CSV，无法选择最佳 step: ${metrics_csv}"
 
   mkdir -p "$(dirname "${best_env}")"
-  python - "${metrics_csv}" "${ckpt_dir}" "${SERIAL_BEST_K}" "${best_env}" "${SERIAL_BEST_CKPTS_TO_KEEP}" <<'PY'
+  python - "${metrics_csv}" "${inference_ckpt_dir}" "${SERIAL_BEST_K}" "${best_env}" <<'PY'
 import csv
 import math
 import re
@@ -134,12 +220,9 @@ import shlex
 import sys
 from pathlib import Path
 
-metrics_csv, ckpt_dir, raw_k, best_env, raw_keep_count = sys.argv[1:]
+metrics_csv, inference_ckpt_dir, raw_k, best_env = sys.argv[1:]
 k = str(int(raw_k))
-keep_count = int(raw_keep_count)
-if keep_count < 1:
-    raise SystemExit(f"SERIAL_BEST_CKPTS_TO_KEEP 必须大于等于 1，当前值: {keep_count}")
-ckpt_dir = Path(ckpt_dir)
+inference_ckpt_dir = Path(inference_ckpt_dir)
 
 
 def to_float(value):
@@ -152,6 +235,15 @@ def to_float(value):
     if math.isnan(number):
         return None
     return number
+
+
+def hf_model_is_ready(path):
+    path = Path(path)
+    if not (path / "config.json").is_file():
+        return False
+    if not any(path.glob("*.safetensors")) and not any(path.glob("*.bin")):
+        return False
+    return any((path / name).is_file() for name in ("tokenizer.json", "tokenizer.model", "vocab.json"))
 
 
 with open(metrics_csv, encoding="utf-8", newline="") as f:
@@ -172,8 +264,8 @@ for row in rows:
     if step_value is None:
         continue
     step = int(step_value)
-    actor_dir = ckpt_dir / f"global_step_{step}" / "actor"
-    if not actor_dir.is_dir():
+    inference_dir = inference_ckpt_dir / f"global_step_{step}"
+    if not hf_model_is_ready(inference_dir):
         continue
 
     mean_values = [to_float(row.get(col)) for col in mean_cols]
@@ -186,17 +278,15 @@ for row in rows:
     candidates.append((score, step, mean16, len(mean_values)))
 
 if not candidates:
-    raise SystemExit(f"{metrics_csv} 中没有同时具备 checkpoint 和 val-core/*/{{acc|reward}}/mean@{k} 的 step")
+    raise SystemExit(f"{metrics_csv} 中没有同时具备推理 checkpoint 和 val-core/*/{{acc|reward}}/mean@{k} 的 step")
 
 candidates.sort(key=lambda candidate: (candidate[0], candidate[1]), reverse=True)
 score, step, mean16, mean_count = candidates[0]
-top_steps = [str(candidate[1]) for candidate in candidates[:keep_count]]
 env_lines = {
     "BEST_STEP": str(step),
     "BEST_SCORE": f"{score:.12g}",
     "BEST_MEAN16": f"{mean16:.12g}",
     "BEST_MEAN_COLUMN_COUNT": str(mean_count),
-    "BEST_TOP_STEPS": " ".join(top_steps),
 }
 with open(best_env, "w", encoding="utf-8") as f:
     for key, value in env_lines.items():
@@ -205,44 +295,7 @@ print(step)
 PY
   # shellcheck source=/dev/null
   source "${best_env}"
-  log "最佳 checkpoint: ${exp_name} step=${BEST_STEP}, val-core mean@${SERIAL_BEST_K}=${BEST_MEAN16}, score=${BEST_SCORE}, 保留前${SERIAL_BEST_CKPTS_TO_KEEP}=${BEST_TOP_STEPS}"
-}
-
-prune_checkpoints_to_best_steps() {
-  local exp_name="$1"
-  local keep_steps="$2"
-  local ckpt_dir="${SAVE_DIR}/checkpoints/${exp_name}"
-
-  [[ -d "${ckpt_dir}" ]] || die "checkpoint 目录不存在，无法清理: ${ckpt_dir}"
-  [[ -n "${keep_steps}" ]] || die "缺少要保留的最佳 checkpoint step 列表: ${exp_name}"
-
-  local -A keep_step_set=()
-  local step
-  for step in ${keep_steps}; do
-    [[ "${step}" =~ ^[0-9]+$ ]] || die "非法 checkpoint step: ${step}"
-    keep_step_set["${step}"]=1
-  done
-
-  local removed_count=0
-  local kept_count=0
-  local ckpt_path
-  local ckpt_name
-  for ckpt_path in "${ckpt_dir}"/global_step_*; do
-    [[ -d "${ckpt_path}" ]] || continue
-    ckpt_name="$(basename "${ckpt_path}")"
-    [[ "${ckpt_name}" =~ ^global_step_([0-9]+)$ ]] || continue
-    step="${BASH_REMATCH[1]}"
-
-    if [[ -n "${keep_step_set[${step}]:-}" ]]; then
-      kept_count=$((kept_count + 1))
-      continue
-    fi
-
-    rm -rf -- "${ckpt_path}"
-    removed_count=$((removed_count + 1))
-  done
-
-  log "checkpoint 清理完成: ${exp_name}, 保留=${kept_count}(${keep_steps}), 删除=${removed_count}, 目录=${ckpt_dir}"
+  log "最佳推理 checkpoint: ${exp_name} step=${BEST_STEP}, val-core mean@${SERIAL_BEST_K}=${BEST_MEAN16}, score=${BEST_SCORE}"
 }
 
 write_formal_eval_config() {
@@ -253,8 +306,18 @@ write_formal_eval_config() {
   local output_subdir="${SERIAL_FORMAL_OUTPUT_SUBDIR_PREFIX}_step${step}_${base_output_subdir}"
 
   {
+    write_config_assignment "PRIMUS_OUTPUT_DIR" "${SAVE_DIR}"
+    write_config_assignment "SAVE_DIR" "${SAVE_DIR}"
+    write_config_assignment "DATA_DIR" "${DATA_DIR}"
+    write_config_assignment "INFERENCE_CKPT_DIR" "${INFERENCE_CKPT_DIR}"
     printf 'source %q\n' "${AER_CONFIG}"
+    write_config_assignment "PRIMUS_OUTPUT_DIR" "${SAVE_DIR}"
+    write_config_assignment "SAVE_DIR" "${SAVE_DIR}"
+    write_config_assignment "DATA_DIR" "${DATA_DIR}"
+    write_config_assignment "INFERENCE_CKPT_DIR" "${INFERENCE_CKPT_DIR}"
     write_config_assignment "TOTAL_TRAINING_STEPS" "${SERIAL_TRAINING_STEPS}"
+    write_config_assignment "CUDA_VISIBLE_DEVICES" "${CUDA_VISIBLE_DEVICES}"
+    write_config_assignment "STOP_RAY_BETWEEN_RUNS" "${STOP_RAY_BETWEEN_RUNS:-1}"
     write_config_assignment "FORMAL_EVAL_EXPERIMENT_NAMES" "${exp_name}"
     write_config_assignment "FORMAL_EVAL_EXTRA_EXPERIMENT_NAMES" ""
     write_config_assignment "FORMAL_EVAL_INCLUDE_BASELINE_NAIVE" "0"
@@ -326,7 +389,6 @@ run_serial_experiment() {
   fi
 
   select_best_checkpoint_step "${exp_name}"
-  prune_checkpoints_to_best_steps "${exp_name}" "${BEST_TOP_STEPS}"
   run_formal_eval_for_best_step "${exp_name}" "${BEST_STEP}"
 }
 
@@ -338,16 +400,22 @@ main() {
   TOTAL_TRAINING_STEPS="${SERIAL_TRAINING_STEPS}"
   TEST_FREQ="${SERIAL_TEST_FREQ}"
   SAVE_FREQ="${SERIAL_SAVE_FREQ}"
-  MAX_ACTOR_CKPT_TO_KEEP="${SERIAL_MAX_CKPTS_TO_KEEP}"
-  MAX_CRITIC_CKPT_TO_KEEP="${SERIAL_MAX_CKPTS_TO_KEEP}"
+  if [[ -n "${SERIAL_MAX_CKPTS_TO_KEEP}" ]]; then
+    MAX_ACTOR_CKPT_TO_KEEP="${SERIAL_MAX_CKPTS_TO_KEEP}"
+    MAX_CRITIC_CKPT_TO_KEEP="${SERIAL_MAX_CKPTS_TO_KEEP}"
+  fi
   VAL_KWARGS_N="${SERIAL_BEST_K}"
   RUN_EVAL_AFTER_TRAIN=1
 
+  apply_serial_gpu_profile "${SERIAL_GPU_PROFILE_PREFIX}"
   check_inputs train
+  ensure_serial_gpu_config
   prepare_dirs
   apply_network_env
 
-  log "串行 AER 训练配置: steps=${TOTAL_TRAINING_STEPS}, test_freq=${TEST_FREQ}, save_freq=${SAVE_FREQ}, max_ckpts=${MAX_ACTOR_CKPT_TO_KEEP}, best_ckpts_to_keep=${SERIAL_BEST_CKPTS_TO_KEEP}"
+  log "串行 AER 训练配置: steps=${TOTAL_TRAINING_STEPS}, test_freq=${TEST_FREQ}, save_freq=${SAVE_FREQ}, training_state_actor_keep=${MAX_ACTOR_CKPT_TO_KEEP}, training_state_critic_keep=${MAX_CRITIC_CKPT_TO_KEEP}"
+  log "路径配置: output=${SAVE_DIR}, data=${DATA_DIR}, inference_ckpt=${INFERENCE_CKPT_DIR}"
+  log "GPU运行配置: profile=${SERIAL_GPU_PROFILE_PREFIX}, CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES}, N_GPUS_PER_NODE=${N_GPUS_PER_NODE}, SIMILARITY_CUDA_VISIBLE_DEVICES=${SIMILARITY_CUDA_VISIBLE_DEVICES:-}, SIMILARITY_NUM_PROCESSES=${SIMILARITY_NUM_PROCESSES}, FORMAL_EVAL_GPUS=${FORMAL_EVAL_GPUS:-${CUDA_VISIBLE_DEVICES}}"
   log "训练期间 CPU 评测指标: metrics=${AFTER_TRAIN_EVAL_METRICS}, ks=${AFTER_TRAIN_EVAL_KS}, semantic_device=${AFTER_TRAIN_EVAL_SEMANTIC_DEVICE:-cpu}"
 
   local spec

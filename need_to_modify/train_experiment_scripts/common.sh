@@ -10,7 +10,9 @@ export AER_CONFIG="${AER_CONFIG:-${NEED_TO_MODIFY_DIR}/config.env}"
 source "${NEED_TO_MODIFY_DIR}/script_process_control.sh"
 
 AER_SINGLE_SCRIPT_OVERRIDE_NAMES=(
-  SAVE_DIR
+  DATA_DIR
+  INFERENCE_CKPT_DIR
+  BEST_INFERENCE_CKPT_DIR
   WANDB_MODE
   WANDB_PROJECT
   WANDB_ENTITY
@@ -52,6 +54,9 @@ source "${NEED_TO_MODIFY_DIR}/run_experiments.sh"
 aer_single_script_restore_env_overrides
 
 refresh_run_paths() {
+  DATA_DIR="${DATA_DIR:-${REPO_ROOT}/save/data}"
+  INFERENCE_CKPT_DIR="${INFERENCE_CKPT_DIR:-${SAVE_DIR}/inference_checkpoints}"
+  BEST_INFERENCE_CKPT_DIR="${BEST_INFERENCE_CKPT_DIR:-${SAVE_DIR}/best_inference_checkpoints}"
   STATE_DIR="${SAVE_DIR}/run/state"
   LOG_DIR="${SAVE_DIR}/run/train_logs"
   EVAL_LOG_DIR="${SAVE_DIR}/run/eval_logs"

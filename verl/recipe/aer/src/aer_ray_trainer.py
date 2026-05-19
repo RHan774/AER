@@ -16,6 +16,8 @@ FSDP PPO Trainer with Ray-based single controller.
 This trainer supports model-agonistic model initialization with huggingface
 """
 
+import os
+import shutil
 import uuid
 from pprint import pprint
 
@@ -79,6 +81,37 @@ class RayAERTrainer(RayPPOTrainer):
         with open_dict(self.config.trainer):
             self.config.trainer.rollout_data_dir = self._normalize_dump_dir(self.config.trainer.get("rollout_data_dir", None))
             self.config.trainer.validation_data_dir = self._normalize_dump_dir(self.config.trainer.get("validation_data_dir", None))
+
+    def _export_inference_checkpoint(self):
+        inference_root = self._normalize_dump_dir(self.config.trainer.get("inference_checkpoint_dir", None))
+        if inference_root is None:
+            return
+
+        local_global_step_folder = os.path.join(self.config.trainer.default_local_dir, f"global_step_{self.global_steps}")
+        hf_source_dir = os.path.join(local_global_step_folder, "actor", "huggingface")
+        if not os.path.isdir(hf_source_dir):
+            print(f"[AER] 未找到用于推理的 HuggingFace checkpoint，跳过导出: {hf_source_dir}")
+            return
+
+        target_dir = os.path.join(inference_root, f"global_step_{self.global_steps}")
+        tmp_target_dir = f"{target_dir}.tmp"
+        os.makedirs(inference_root, exist_ok=True)
+        for path in (tmp_target_dir, target_dir):
+            if os.path.lexists(path):
+                if os.path.isdir(path) and not os.path.islink(path):
+                    shutil.rmtree(path)
+                else:
+                    os.unlink(path)
+
+        # 将推理用 checkpoint 独立保存，随后删除训练 state 内的临时 HF 副本，避免训练 state 被推理副本撑大。
+        shutil.copytree(hf_source_dir, tmp_target_dir)
+        os.replace(tmp_target_dir, target_dir)
+        shutil.rmtree(hf_source_dir, ignore_errors=True)
+        print(f"[AER] 已导出推理 checkpoint: {target_dir}")
+
+    def _save_checkpoint(self):
+        super()._save_checkpoint()
+        self._export_inference_checkpoint()
     
     def fit(self):
         """

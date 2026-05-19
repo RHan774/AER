@@ -15,8 +15,10 @@ source "${CONFIG_FILE}"
 
 AER_DIR="${REPO_ROOT}/verl/recipe/aer"
 VERL_DIR="${REPO_ROOT}/verl"
+DATA_DIR="${DATA_DIR:-${REPO_ROOT}/save/data}"
+INFERENCE_CKPT_DIR="${INFERENCE_CKPT_DIR:-${SAVE_DIR}/inference_checkpoints}"
 EVAL_DIR="${SAVE_DIR}/eval"
-LOG_ROOT="${SCRIPT_DIR}/eval_logs/$(date '+%Y%m%d_%H%M%S')"
+LOG_ROOT="${SAVE_DIR}/run/formal_eval_logs/$(date '+%Y%m%d_%H%M%S')"
 MASTER_LOG="${LOG_ROOT}/master.log"
 
 mkdir -p "${LOG_ROOT}"
@@ -256,6 +258,12 @@ hf_model_is_ready() {
   [[ -f "${model_dir}/tokenizer.json" || -f "${model_dir}/tokenizer.model" || -f "${model_dir}/vocab.json" ]] || return 1
 }
 
+inference_checkpoint_path() {
+  local exp_name="$1"
+  local step="$2"
+  printf '%s/%s/global_step_%s' "${INFERENCE_CKPT_DIR}" "${exp_name}" "${step}"
+}
+
 stop_ray_if_needed() {
   bool_is_true "${STOP_RAY_BETWEEN_RUNS:-1}" || return 0
   if command -v ray >/dev/null 2>&1; then
@@ -395,6 +403,8 @@ print_status() {
 REPO_ROOT=${REPO_ROOT}
 CONFIG_FILE=${CONFIG_FILE}
 SAVE_DIR=${SAVE_DIR}
+DATA_DIR=${DATA_DIR}
+INFERENCE_CKPT_DIR=${INFERENCE_CKPT_DIR}
 LOG_ROOT=${LOG_ROOT}
 CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES}
 EVAL_GPUS=${EVAL_GPUS}
@@ -425,7 +435,6 @@ preflight() {
 
   [[ -d "${VERL_DIR}" ]] || missing+=("缺少 verl 目录: ${VERL_DIR}")
   [[ -d "${AER_DIR}" ]] || missing+=("缺少 AER recipe 目录: ${AER_DIR}")
-  [[ -f "${VERL_DIR}/scripts/model_merger.py" ]] || missing+=("缺少模型合并脚本: ${VERL_DIR}/scripts/model_merger.py")
   [[ -f "${AER_DIR}/eval/eval_from_model.py" ]] || missing+=("缺少模型推理评估入口: ${AER_DIR}/eval/eval_from_model.py")
   [[ -f "${AER_DIR}/eval/eval_from_jsonl.py" ]] || missing+=("缺少 JSONL 汇总评估入口: ${AER_DIR}/eval/eval_from_jsonl.py")
 
@@ -471,14 +480,9 @@ PY
   fi
 
   for exp_name in "${FORMAL_EXPS[@]}"; do
-    local actor_dir="${SAVE_DIR}/checkpoints/${exp_name}/global_step_${EVAL_CHECKPOINT_STEP}/actor"
-    local hf_dir="${SAVE_DIR}/checkpoints/${exp_name}/global_step_${EVAL_CHECKPOINT_STEP}_hf"
-    if ! hf_model_is_ready "${hf_dir}"; then
-      [[ -d "${actor_dir}" ]] || missing+=("缺少待合并 actor checkpoint: ${actor_dir}")
-      if [[ -d "${actor_dir}" ]] && ! compgen -G "${actor_dir}/model_world_size_*_rank_0.pt" >/dev/null; then
-        missing+=("actor checkpoint 缺少 FSDP rank0 权重文件: ${actor_dir}/model_world_size_*_rank_0.pt")
-      fi
-    fi
+    local inference_dir
+    inference_dir="$(inference_checkpoint_path "${exp_name}" "${EVAL_CHECKPOINT_STEP}")"
+    hf_model_is_ready "${inference_dir}" || missing+=("缺少可用于推理的 checkpoint: ${inference_dir}")
   done
 
   if [[ "${#missing[@]}" -ne 0 ]]; then
@@ -488,25 +492,11 @@ PY
   fi
 }
 
-merge_checkpoint_if_needed() {
+ensure_inference_checkpoint_ready() {
   local exp_name="$1"
-  local actor_dir="${SAVE_DIR}/checkpoints/${exp_name}/global_step_${EVAL_CHECKPOINT_STEP}/actor"
-  local hf_dir="${SAVE_DIR}/checkpoints/${exp_name}/global_step_${EVAL_CHECKPOINT_STEP}_hf"
-  local log_file="${LOG_ROOT}/${exp_name}/merge.log"
-
-  if hf_model_is_ready "${hf_dir}" && ! bool_is_true "${EVAL_FORCE_MERGE:-${FORCE_RERUN:-0}}"; then
-    log "HF 模型已存在，跳过合并: ${hf_dir}"
-    return 0
-  fi
-
-  log "合并 checkpoint 为 HuggingFace 模型: ${exp_name}"
-  run_logged "${log_file}" \
-    python "${VERL_DIR}/scripts/model_merger.py" merge \
-      --backend fsdp \
-      --local_dir "${actor_dir}" \
-      --target_dir "${hf_dir}"
-
-  hf_model_is_ready "${hf_dir}" || die "模型合并后未检测到有效 HuggingFace 模型目录: ${hf_dir}"
+  local inference_dir
+  inference_dir="$(inference_checkpoint_path "${exp_name}" "${EVAL_CHECKPOINT_STEP}")"
+  hf_model_is_ready "${inference_dir}" || die "缺少可用于推理的 checkpoint: ${inference_dir}"
 }
 
 eval_output_dir_for_exp() {
@@ -652,8 +642,8 @@ run_one_experiment() {
     return 0
   fi
 
-  model_path="${SAVE_DIR}/checkpoints/${exp_name}/global_step_${EVAL_CHECKPOINT_STEP}_hf"
-  merge_checkpoint_if_needed "${exp_name}"
+  model_path="$(inference_checkpoint_path "${exp_name}" "${EVAL_CHECKPOINT_STEP}")"
+  ensure_inference_checkpoint_ready "${exp_name}"
   stop_ray_if_needed
   run_sharded_inference "${exp_name}" "${model_path}" "${output_dir}"
   run_jsonl_eval "${exp_name}" "${output_dir}"
@@ -689,10 +679,10 @@ main() {
   EVAL_FORCE_MERGE="${FORMAL_EVAL_FORCE_MERGE:-${EVAL_FORCE_MERGE:-0}}"
 
   VAL_FILES=(
-    "${SAVE_DIR}/data/math-ai/math500/test_repeated.parquet"
-    "${SAVE_DIR}/data/math-ai/amc23/test_repeated.parquet"
-    "${SAVE_DIR}/data/math-ai/aime24/test_repeated.parquet"
-    "${SAVE_DIR}/data/math-ai/aime25/test_repeated.parquet"
+    "${DATA_DIR}/math-ai/math500/test_repeated.parquet"
+    "${DATA_DIR}/math-ai/amc23/test_repeated.parquet"
+    "${DATA_DIR}/math-ai/aime24/test_repeated.parquet"
+    "${DATA_DIR}/math-ai/aime25/test_repeated.parquet"
   )
 
   activate_conda
