@@ -356,6 +356,36 @@ class SimilarityAlgorithmTest(unittest.TestCase):
         self.assertAlmostEqual(result["reward_tensor_exploration"].sum().item(), 1.0, places=6)
         _parse_golden_answer_cached.cache_clear()
 
+    def test_semantic_embedding_training_exploration_reward_is_scaled(self):
+        class FakeSimilarityComputer:
+            def compute(self, data, tokenizer=None):
+                return torch.ones((len(data), len(data)), dtype=torch.float32)
+
+        tokenizer = FakeTokenizer({1: "a", 101: "prompt"})
+        data = FakeDataProto(
+            responses=[[1], [1]],
+            uids=["g1", "g1"],
+            reward_models=[{"ground_truth": "42"}, {"ground_truth": "42"}],
+            data_sources=["math", "math"],
+        )
+        manager = AERRewardManager(
+            tokenizer=tokenizer,
+            similarity_algorithm="semantic_embedding",
+            exploration_metric_algorithms=[],
+        )
+        manager.similarity_computer = FakeSimilarityComputer()
+
+        _parse_golden_answer_cached.cache_clear()
+        with patch("recipe.aer.src.reward_manager.parse", return_value=["x"]), patch(
+            "recipe.aer.src.reward_manager.verify",
+            return_value=True,
+        ):
+            result = manager(data, num_examine=0)
+
+        self.assertEqual(result["reward_exploration_metrics_by_algorithm"], {})
+        self.assertAlmostEqual(result["reward_tensor_exploration"].sum().item(), 10.0, places=6)
+        _parse_golden_answer_cached.cache_clear()
+
     def test_aer_reward_manager_preserves_compute_score_override(self):
         tokenizer = FakeTokenizer({1: "a", 101: "prompt"})
         data = FakeDataProto(

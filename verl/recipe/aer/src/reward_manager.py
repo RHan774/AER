@@ -35,6 +35,7 @@ _TEXT_DECODING_SIMILARITY_ALGORITHMS = {
     "compression_ratio",
     "rouge_l",
 }
+_SEMANTIC_EMBEDDING_EXPLORATION_SCALE = 10.0
 
 
 @lru_cache(maxsize=65536)
@@ -405,6 +406,14 @@ def _compute_exploration_values(similarity_matrix: torch.Tensor) -> torch.Tensor
     return exploration_values
 
 
+def _scale_selected_exploration_values(algorithm: str, exploration_values: torch.Tensor) -> torch.Tensor:
+    """对被选中的相似度算法应用探索奖励倍率。"""
+
+    if algorithm == "semantic_embedding":
+        return exploration_values * _SEMANTIC_EMBEDDING_EXPLORATION_SCALE
+    return exploration_values
+
+
 class AERRewardManager:
     # add: 添加相似度算法参数支持
     def __init__(
@@ -527,6 +536,9 @@ class AERRewardManager:
             exploration_values = _compute_exploration_values(
                 self.similarity_computer.compute(data, tokenizer=tokenizer)
             )
+        exploration_values = _scale_selected_exploration_values(self.similarity_algorithm, exploration_values)
+        if self.similarity_algorithm in exploration_values_by_algorithm:
+            exploration_values_by_algorithm[self.similarity_algorithm] = exploration_values
         reward_exploration_metrics_by_algorithm = {
             algorithm: algorithm_values.mean().item()
             for algorithm, algorithm_values in exploration_values_by_algorithm.items()
