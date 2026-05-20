@@ -20,10 +20,10 @@ resume_from_path=""
 train_batch_size=128
 ppo_mini_batch_size=32
 # bs=128 后不能继续假设 300~400 step 收敛；先用 naive GRPO 做收敛扫描。
-total_training_steps=504
-# 每 24 step 保存一次，和 test_freq=12 配合，可保留每两个验证点一个可恢复 checkpoint。
-save_freq=36
-test_freq=36
+total_training_steps=360
+# 每 save_freq step 保存一次；当前和 test_freq 对齐，保证每个验证点都有可恢复 checkpoint。
+save_freq=12
+test_freq=12
 experiment_name="baseline-naive-grpo-tau${tau}-all-similarity-metrics"
 # experiment_name="baseline-entropy_coeff${entropy_coeff}"
 max_actor_ckpt_to_keep=8
@@ -127,7 +127,10 @@ n_gpus_per_node=4
 # save_freq=50
 # # modify: 原来是50，改为10 (10个step测试一次)
 # test_freq=10
+# 训练 state checkpoint 仍由 max_actor_ckpt_to_keep / max_critic_ckpt_to_keep 控制保留数量；
+# 每个保存步会额外导出一份独立的 HuggingFace 推理 checkpoint，不参与训练 state 的清理。
 default_local_dir="${save_dir}/checkpoints/${experiment_name}"
+inference_checkpoint_dir="${save_dir}/inference_checkpoints/${experiment_name}"
 
 # debug0: Ray集群问题:
 # requests.exceptions.HTTPError: 502 Server Error: Bad Gateway for url: http://127.0.0.1:8265/api/version
@@ -187,6 +190,7 @@ nohup /data/ruanruihan/.conda/envs/aer/bin/python -m recipe.aer.src.main_ppo \
     actor_rollout_ref.actor.optim.weight_decay=${weight_decay} \
     actor_rollout_ref.actor.fsdp_config.param_offload=${offload} \
     actor_rollout_ref.actor.fsdp_config.optimizer_offload=${offload} \
+    actor_rollout_ref.actor.checkpoint.contents="[model,optimizer,extra,hf_model]" \
     actor_rollout_ref.rollout.temperature=${temperature} \
     actor_rollout_ref.rollout.top_p=${top_p} \
     actor_rollout_ref.rollout.gpu_memory_utilization=${gpu_memory_utilization} \
@@ -225,4 +229,5 @@ nohup /data/ruanruihan/.conda/envs/aer/bin/python -m recipe.aer.src.main_ppo \
     trainer.test_freq="${test_freq}" \
     trainer.max_actor_ckpt_to_keep="${max_actor_ckpt_to_keep}" \
     trainer.max_critic_ckpt_to_keep="${max_critic_ckpt_to_keep}" \
-    trainer.default_local_dir="${default_local_dir}" > baseline_naive_grpo_tau0_all_similarity_metrics_log.txt 2>&1 &
+    trainer.default_local_dir="${default_local_dir}" \
+    trainer.inference_checkpoint_dir="${inference_checkpoint_dir}" > baseline_naive_grpo_tau0_all_similarity_metrics_log.txt 2>&1 &
