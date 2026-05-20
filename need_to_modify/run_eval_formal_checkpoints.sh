@@ -18,7 +18,7 @@ VERL_DIR="${REPO_ROOT}/verl"
 DATA_DIR="${DATA_DIR:-${REPO_ROOT}/save/data}"
 INFERENCE_CKPT_DIR="${INFERENCE_CKPT_DIR:-${SAVE_DIR}/inference_checkpoints}"
 EVAL_DIR="${SAVE_DIR}/eval"
-LOG_ROOT="${SAVE_DIR}/run/formal_eval_logs/$(date '+%Y%m%d_%H%M%S')"
+LOG_ROOT="${FORMAL_EVAL_LOG_ROOT:-${SAVE_DIR}/run/formal_eval_logs/$(date '+%Y%m%d_%H%M%S')}"
 MASTER_LOG="${LOG_ROOT}/master.log"
 
 mkdir -p "${LOG_ROOT}"
