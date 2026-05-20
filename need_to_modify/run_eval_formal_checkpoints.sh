@@ -398,6 +398,22 @@ collect_formal_experiments() {
   fi
 }
 
+collect_explicit_formal_experiments() {
+  FORMAL_EXPS=()
+
+  local exp_name
+  for exp_name in ${FORMAL_EVAL_EXPERIMENT_NAMES:-}; do
+    add_experiment "${exp_name}"
+  done
+  for exp_name in ${FORMAL_EVAL_EXTRA_EXPERIMENT_NAMES:-}; do
+    add_experiment "${exp_name}"
+  done
+
+  if [[ "${#FORMAL_EXPS[@]}" -eq 0 ]]; then
+    die "FORMAL_EVAL_EXPLICIT_ONLY=1 但未配置 FORMAL_EVAL_EXPERIMENT_NAMES。"
+  fi
+}
+
 print_status() {
   cat <<EOF
 REPO_ROOT=${REPO_ROOT}
@@ -687,7 +703,11 @@ main() {
 
   activate_conda
   apply_runtime_env
-  collect_formal_experiments
+  if bool_is_true "${FORMAL_EVAL_EXPLICIT_ONLY:-0}"; then
+    collect_explicit_formal_experiments
+  else
+    collect_formal_experiments
+  fi
   print_status
   printf 'FORMAL_EXPERIMENTS:\n'
   printf '  - %s\n' "${FORMAL_EXPS[@]}"

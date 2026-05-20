@@ -330,6 +330,7 @@ write_formal_eval_config() {
     write_config_assignment "STOP_RAY_BETWEEN_RUNS" "${STOP_RAY_BETWEEN_RUNS:-1}"
     write_config_assignment "FORMAL_EVAL_EXPERIMENT_NAMES" "${exp_name}"
     write_config_assignment "FORMAL_EVAL_EXTRA_EXPERIMENT_NAMES" ""
+    write_config_assignment "FORMAL_EVAL_EXPLICIT_ONLY" "1"
     write_config_assignment "FORMAL_EVAL_INCLUDE_BASELINE_NAIVE" "0"
     write_config_assignment "FORMAL_EVAL_INCLUDE_BASELINE_ENTROPY" "0"
     write_config_assignment "FORMAL_EVAL_INCLUDE_GAMMA_SEARCH" "0"
