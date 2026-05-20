@@ -20,7 +20,7 @@ SERIAL_TEST_FREQ="${SERIAL_TEST_FREQ:-12}"
 SERIAL_SAVE_FREQ="${SERIAL_SAVE_FREQ:-${SERIAL_TEST_FREQ}}"
 SERIAL_MAX_CKPTS_TO_KEEP="${SERIAL_MAX_CKPTS_TO_KEEP:-}"
 
-# 最佳 checkpoint 选择：对所有 val-core/*/{acc|reward}/mean@16 取均值，均值最高者胜出。
+# 最佳 checkpoint 选择：对所有 val-core/**/acc/mean@16 取均值，均值最高者胜出。
 SERIAL_BEST_K="${SERIAL_BEST_K:-16}"
 
 # 全量评测输出子目录前缀；最终目录会自动附加 step 和 config.env 中的 FORMAL_EVAL_OUTPUT_SUBDIR。
@@ -111,6 +111,12 @@ write_config_assignment() {
 
 safe_file_tag() {
   aer_pc_safe_name "$1"
+}
+
+formal_eval_output_subdir_for_step() {
+  local step="$1"
+  local base_output_subdir="${FORMAL_EVAL_OUTPUT_SUBDIR:-formal_pass${FORMAL_EVAL_SAMPLES_PER_PROMPT:-128}_sharded}"
+  printf '%s_step%s_%s' "${SERIAL_FORMAL_OUTPUT_SUBDIR_PREFIX}" "${step}" "${base_output_subdir}"
 }
 
 count_csv_items() {
@@ -252,11 +258,14 @@ with open(metrics_csv, encoding="utf-8", newline="") as f:
     rows = list(reader)
 
 mean_suffix = f"/mean@{k}"
-mean_pattern = re.compile(rf"^val-core/[^/]+/(acc|reward){re.escape(mean_suffix)}$")
+# 数据源名称可能包含斜杠，例如 math-ai/math500，因此这里从右侧识别 acc 指标段。
+mean_pattern = re.compile(rf"^val-core/.+/acc{re.escape(mean_suffix)}$")
 mean_cols = [name for name in fieldnames if mean_pattern.match(name)]
 
 if not mean_cols:
-    raise SystemExit(f"{metrics_csv} 缺少 val-core/*/{{acc|reward}}/mean@{k} 列；请确认 VAL_KWARGS_N={k}")
+    val_core_cols = [name for name in fieldnames if name.startswith("val-core/")]
+    preview = ", ".join(val_core_cols[:8]) if val_core_cols else "<无 val-core 列>"
+    raise SystemExit(f"{metrics_csv} 缺少 val-core/**/acc/mean@{k} 列；请确认 VAL_KWARGS_N={k}。现有 val-core 列示例: {preview}")
 
 candidates = []
 for row in rows:
@@ -278,7 +287,7 @@ for row in rows:
     candidates.append((score, step, mean16, len(mean_values)))
 
 if not candidates:
-    raise SystemExit(f"{metrics_csv} 中没有同时具备推理 checkpoint 和 val-core/*/{{acc|reward}}/mean@{k} 的 step")
+    raise SystemExit(f"{metrics_csv} 中没有同时具备推理 checkpoint 和 val-core/**/acc/mean@{k} 的 step")
 
 candidates.sort(key=lambda candidate: (candidate[0], candidate[1]), reverse=True)
 score, step, mean16, mean_count = candidates[0]
@@ -302,8 +311,9 @@ write_formal_eval_config() {
   local exp_name="$1"
   local step="$2"
   local config_path="$3"
-  local base_output_subdir="${FORMAL_EVAL_OUTPUT_SUBDIR:-formal_pass${FORMAL_EVAL_SAMPLES_PER_PROMPT:-128}_sharded}"
-  local output_subdir="${SERIAL_FORMAL_OUTPUT_SUBDIR_PREFIX}_step${step}_${base_output_subdir}"
+  local formal_log_root="${4:-}"
+  local output_subdir
+  output_subdir="$(formal_eval_output_subdir_for_step "${step}")"
 
   {
     write_config_assignment "PRIMUS_OUTPUT_DIR" "${SAVE_DIR}"
@@ -326,6 +336,9 @@ write_formal_eval_config() {
     write_config_assignment "FORMAL_EVAL_MAIN_ALGORITHMS" ""
     write_config_assignment "FORMAL_EVAL_CHECKPOINT_STEP" "${step}"
     write_config_assignment "FORMAL_EVAL_OUTPUT_SUBDIR" "${output_subdir}"
+    if [[ -n "${formal_log_root}" ]]; then
+      write_config_assignment "FORMAL_EVAL_LOG_ROOT" "${formal_log_root}"
+    fi
     write_config_assignment "FORMAL_EVAL_GPUS" "${FORMAL_EVAL_GPUS:-${CUDA_VISIBLE_DEVICES}}"
     write_config_assignment "FORMAL_EVAL_METRICS" "${FORMAL_EVAL_METRICS}"
     write_config_assignment "FORMAL_EVAL_KS" "${FORMAL_EVAL_KS}"
@@ -350,14 +363,58 @@ write_formal_eval_config() {
   } > "${config_path}"
 }
 
+write_formal_eval_status() {
+  local status_file="$1"
+  local status="$2"
+  local exp_name="$3"
+  local step="$4"
+  local output_dir="$5"
+  local log_root="$6"
+  local config_path="$7"
+  local exit_code="${8:-}"
+
+  mkdir -p "$(dirname "${status_file}")"
+  {
+    write_config_assignment "STATUS" "${status}"
+    write_config_assignment "EXPERIMENT_NAME" "${exp_name}"
+    write_config_assignment "BEST_STEP" "${step}"
+    write_config_assignment "OUTPUT_DIR" "${output_dir}"
+    write_config_assignment "FORMAL_EVAL_LOG_ROOT" "${log_root}"
+    write_config_assignment "FORMAL_EVAL_MASTER_LOG" "${log_root}/master.log"
+    write_config_assignment "FORMAL_EVAL_CONFIG" "${config_path}"
+    write_config_assignment "UPDATED_AT" "$(date '+%Y-%m-%d %H:%M:%S')"
+    if [[ -n "${exit_code}" ]]; then
+      write_config_assignment "EXIT_CODE" "${exit_code}"
+    fi
+  } > "${status_file}"
+}
+
 run_formal_eval_for_best_step() {
   local exp_name="$1"
   local step="$2"
   local config_path="${TMP_DIR}/serial_formal_$(safe_file_tag "${exp_name}")_step${step}.env"
+  local output_subdir
+  local output_dir
+  local log_root
+  local status_file
 
-  write_formal_eval_config "${exp_name}" "${step}" "${config_path}"
-  log "开始全量评测最佳 checkpoint: ${exp_name} global_step_${step}"
-  AER_CONFIG="${config_path}" bash "${SCRIPT_DIR}/run_eval_formal_checkpoints.sh"
+  output_subdir="$(formal_eval_output_subdir_for_step "${step}")"
+  output_dir="${EVAL_DIR}/${exp_name}/${output_subdir}"
+  log_root="${SAVE_DIR}/run/formal_eval_logs/serial_$(date '+%Y%m%d_%H%M%S')_$(safe_file_tag "${exp_name}")_step${step}"
+  status_file="${EVAL_DIR}/${exp_name}/formal_best_step${step}.status.env"
+
+  write_formal_eval_config "${exp_name}" "${step}" "${config_path}" "${log_root}"
+  write_formal_eval_status "${status_file}" "running" "${exp_name}" "${step}" "${output_dir}" "${log_root}" "${config_path}"
+  log "开始全量评测最佳 checkpoint: ${exp_name} global_step_${step}，状态: ${status_file}"
+  if FORMAL_EVAL_LOG_ROOT="${log_root}" AER_CONFIG="${config_path}" bash "${SCRIPT_DIR}/run_eval_formal_checkpoints.sh"; then
+    write_formal_eval_status "${status_file}" "succeeded" "${exp_name}" "${step}" "${output_dir}" "${log_root}" "${config_path}" "0"
+    log "完成全量评测最佳 checkpoint: ${exp_name} global_step_${step}，结果: ${output_dir}"
+  else
+    local exit_code="$?"
+    write_formal_eval_status "${status_file}" "failed" "${exp_name}" "${step}" "${output_dir}" "${log_root}" "${config_path}" "${exit_code}"
+    log "全量评测失败: ${exp_name} global_step_${step}，退出码=${exit_code}，主日志: ${log_root}/master.log"
+    return "${exit_code}"
+  fi
 }
 
 parse_experiment_spec() {
