@@ -20,11 +20,17 @@ SERIAL_TRAINING_STEPS="${SERIAL_TRAINING_STEPS:-360}"
 # 每个验证步都保存 checkpoint，这样最佳验证步一定有 checkpoint 可做全量评测。
 SERIAL_TEST_FREQ="${SERIAL_TEST_FREQ:-12}"
 SERIAL_SAVE_FREQ="${SERIAL_SAVE_FREQ:-${SERIAL_TEST_FREQ}}"
-SERIAL_MAX_CKPTS_TO_KEEP="${SERIAL_MAX_CKPTS_TO_KEEP:-0}"
 
-# 最佳 checkpoint 选择：对所有 val-core/*/{acc|reward}/mean@16 取均值，均值最高者胜出。
+# 最佳 checkpoint 选择：对所有 val-core/**/acc/mean@16 取均值，均值最高者胜出。
 SERIAL_BEST_K="${SERIAL_BEST_K:-16}"
 SERIAL_BEST_CKPTS_TO_KEEP="${SERIAL_BEST_CKPTS_TO_KEEP:-3}"
+
+# 后台把训练格式 checkpoint 转成推理格式 checkpoint。
+# 训练格式 checkpoint 的保留数量默认沿用 config.env 中的 MAX_ACTOR_CKPT_TO_KEEP/MAX_CRITIC_CKPT_TO_KEEP；
+# 如设置 SERIAL_MAX_CKPTS_TO_KEEP，则同时覆盖 actor/critic 的训练格式保留数量。
+SERIAL_CONVERT_SAVED_CKPTS_TO_HF="${SERIAL_CONVERT_SAVED_CKPTS_TO_HF:-1}"
+SERIAL_DELETE_TRAIN_CKPT_AFTER_HF="${SERIAL_DELETE_TRAIN_CKPT_AFTER_HF:-1}"
+SERIAL_CKPT_CONVERT_INTERVAL_SECONDS="${SERIAL_CKPT_CONVERT_INTERVAL_SECONDS:-30}"
 
 # 全量评测输出子目录前缀；最终目录会自动附加 step 和 config.env 中的 FORMAL_EVAL_OUTPUT_SUBDIR。
 SERIAL_FORMAL_OUTPUT_SUBDIR_PREFIX="${SERIAL_FORMAL_OUTPUT_SUBDIR_PREFIX:-formal_best}"
@@ -43,6 +49,11 @@ AER_SERIAL_OVERRIDE_NAMES=(
   WANDB_ENTITY
   CUDA_VISIBLE_DEVICES
   N_GPUS_PER_NODE
+  MAX_ACTOR_CKPT_TO_KEEP
+  MAX_CRITIC_CKPT_TO_KEEP
+  SERIAL_MAX_CKPTS_TO_KEEP
+  SERIAL_MAX_ACTOR_CKPTS_TO_KEEP
+  SERIAL_MAX_CRITIC_CKPTS_TO_KEEP
   MODEL_PATH
   EMBEDDING_MODEL_PATH
   SIMILARITY_DEVICE
@@ -83,10 +94,20 @@ aer_single_script_capture_env_overrides "${AER_SERIAL_OVERRIDE_NAMES[@]}"
 source "${SCRIPT_DIR}/run_experiments.sh"
 aer_single_script_restore_env_overrides
 
+SERIAL_MAX_ACTOR_CKPTS_TO_KEEP="${SERIAL_MAX_ACTOR_CKPTS_TO_KEEP:-${SERIAL_MAX_CKPTS_TO_KEEP:-${MAX_ACTOR_CKPT_TO_KEEP:-0}}}"
+SERIAL_MAX_CRITIC_CKPTS_TO_KEEP="${SERIAL_MAX_CRITIC_CKPTS_TO_KEEP:-${SERIAL_MAX_CKPTS_TO_KEEP:-${MAX_CRITIC_CKPT_TO_KEEP:-0}}}"
+SERIAL_TRAIN_FORMAT_ACTOR_KEEP="${SERIAL_MAX_ACTOR_CKPTS_TO_KEEP}"
+SERIAL_TRAIN_FORMAT_CRITIC_KEEP="${SERIAL_MAX_CRITIC_CKPTS_TO_KEEP}"
+
 # 支持 `bash need_to_modify/run_serial_aer_360.sh stop` 停止当前串行队列及其子进程。
 aer_single_script_init "serial_aer_360" "${BASH_SOURCE[0]}" "$@"
 
+SERIAL_CKPT_WATCHER_PID=""
+SERIAL_CKPT_WATCHER_STOP_FILE=""
+
 serial_cleanup() {
+  stop_checkpoint_watcher || true
+  wait_checkpoint_watcher || true
   stop_eval_watcher || true
   wait_eval_bg || true
   aer_single_script_unregister || true
@@ -111,6 +132,241 @@ write_config_assignment() {
 
 safe_file_tag() {
   aer_pc_safe_name "$1"
+}
+
+serial_validate_nonnegative_int() {
+  local name="$1"
+  local value="$2"
+  [[ "${value}" =~ ^[0-9]+$ ]] || die "${name} 必须是非负整数，当前值: ${value}"
+}
+
+serial_hf_model_is_ready() {
+  local model_dir="$1"
+  [[ -f "${model_dir}/config.json" ]] || return 1
+  if ! compgen -G "${model_dir}/*.safetensors" >/dev/null && ! compgen -G "${model_dir}/*.bin" >/dev/null; then
+    return 1
+  fi
+  [[ -f "${model_dir}/tokenizer.json" || -f "${model_dir}/tokenizer.model" || -f "${model_dir}/vocab.json" ]] || return 1
+}
+
+serial_actor_checkpoint_is_complete() {
+  local actor_dir="$1"
+  [[ -d "${actor_dir}" ]] || return 1
+  [[ -f "${actor_dir}/config.json" ]] || return 1
+  [[ -f "${actor_dir}/tokenizer.json" || -f "${actor_dir}/tokenizer.model" || -f "${actor_dir}/vocab.json" ]] || return 1
+
+  local rank0_file
+  local rank0_name
+  local world_size
+  rank0_file="$(find "${actor_dir}" -maxdepth 1 -type f -name 'model_world_size_*_rank_0.pt' | head -n 1)"
+  [[ -n "${rank0_file}" ]] || return 1
+  rank0_name="$(basename "${rank0_file}")"
+  [[ "${rank0_name}" =~ ^model_world_size_([0-9]+)_rank_0\.pt$ ]] || return 1
+  world_size="${BASH_REMATCH[1]}"
+
+  local rank
+  for ((rank = 0; rank < world_size; rank += 1)); do
+    [[ -s "${actor_dir}/model_world_size_${world_size}_rank_${rank}.pt" ]] || return 1
+  done
+}
+
+serial_checkpoint_steps() {
+  local ckpt_dir="$1"
+  [[ -d "${ckpt_dir}" ]] || return 0
+
+  local path
+  local name
+  local steps=()
+  shopt -s nullglob
+  for path in "${ckpt_dir}"/global_step_*; do
+    [[ -d "${path}" ]] || continue
+    name="$(basename "${path}")"
+    [[ "${name}" =~ ^global_step_([0-9]+)$ ]] || continue
+    steps+=("${BASH_REMATCH[1]}")
+  done
+  shopt -u nullglob
+
+  if [[ "${#steps[@]}" -gt 0 ]]; then
+    printf '%s\n' "${steps[@]}" | sort -n
+  fi
+}
+
+serial_train_keep_count() {
+  local actor_keep="${SERIAL_TRAIN_FORMAT_ACTOR_KEEP:-0}"
+  local critic_keep="${SERIAL_TRAIN_FORMAT_CRITIC_KEEP:-0}"
+  if (( critic_keep > actor_keep )); then
+    printf '%s' "${critic_keep}"
+  else
+    printf '%s' "${actor_keep}"
+  fi
+}
+
+serial_prune_training_checkpoints() {
+  local exp_name="$1"
+  bool_is_true "${SERIAL_DELETE_TRAIN_CKPT_AFTER_HF}" || return 0
+
+  local keep_count
+  keep_count="$(serial_train_keep_count)"
+  (( keep_count > 0 )) || return 0
+
+  local ckpt_dir="${SAVE_DIR}/checkpoints/${exp_name}"
+  local steps=()
+  local step
+  while IFS= read -r step; do
+    [[ -n "${step}" ]] || continue
+    steps+=("${step}")
+  done < <(serial_checkpoint_steps "${ckpt_dir}")
+
+  local total="${#steps[@]}"
+  (( total > keep_count )) || return 0
+
+  local remove_count=$((total - keep_count))
+  local idx
+  local removed=0
+  for ((idx = 0; idx < remove_count; idx += 1)); do
+    step="${steps[$idx]}"
+    if ! serial_hf_model_is_ready "${ckpt_dir}/global_step_${step}_hf"; then
+      continue
+    fi
+    rm -rf -- "${ckpt_dir}/global_step_${step}"
+    removed=$((removed + 1))
+  done
+
+  if (( removed > 0 )); then
+    log "已删除 ${exp_name} 的 ${removed} 个旧训练格式 checkpoint；保留最近 ${keep_count} 个训练格式 checkpoint"
+  fi
+}
+
+serial_merge_checkpoint_to_hf() {
+  local exp_name="$1"
+  local step="$2"
+  local ckpt_dir="${SAVE_DIR}/checkpoints/${exp_name}"
+  local actor_dir="${ckpt_dir}/global_step_${step}/actor"
+  local hf_dir="${ckpt_dir}/global_step_${step}_hf"
+  local lock_dir="${ckpt_dir}/.merge_global_step_${step}.running"
+  local tmp_dir="${hf_dir}.tmp.$$"
+  local status=0
+
+  if serial_hf_model_is_ready "${hf_dir}"; then
+    return 0
+  fi
+  if ! serial_actor_checkpoint_is_complete "${actor_dir}"; then
+    return 0
+  fi
+  if ! mkdir "${lock_dir}" 2>/dev/null; then
+    return 0
+  fi
+
+  log "转换推理格式 checkpoint: ${exp_name} global_step_${step} -> ${hf_dir}"
+  rm -rf -- "${tmp_dir}"
+  if bool_is_true "${DRY_RUN:-0}"; then
+    rm -rf -- "${lock_dir}"
+    return 0
+  fi
+
+  (
+    cd "${VERL_DIR}"
+    export CUDA_VISIBLE_DEVICES=""
+    python "${VERL_DIR}/scripts/model_merger.py" merge \
+      --backend fsdp \
+      --local_dir "${actor_dir}" \
+      --target_dir "${tmp_dir}"
+  ) || status=$?
+
+  if [[ "${status}" -eq 0 ]] && serial_hf_model_is_ready "${tmp_dir}"; then
+    rm -rf -- "${hf_dir}"
+    mv "${tmp_dir}" "${hf_dir}"
+    log "推理格式 checkpoint 已保存: ${hf_dir}"
+  else
+    rm -rf -- "${tmp_dir}"
+    log "推理格式 checkpoint 转换失败: ${exp_name} global_step_${step}, status=${status}"
+    status=1
+  fi
+
+  rm -rf -- "${lock_dir}"
+  return "${status}"
+}
+
+serial_scan_checkpoints_once() {
+  local exp_name="$1"
+  local ckpt_dir="${SAVE_DIR}/checkpoints/${exp_name}"
+  local step
+
+  [[ -d "${ckpt_dir}" ]] || return 0
+  while IFS= read -r step; do
+    [[ -n "${step}" ]] || continue
+    serial_merge_checkpoint_to_hf "${exp_name}" "${step}" || true
+    serial_prune_training_checkpoints "${exp_name}" || true
+  done < <(serial_checkpoint_steps "${ckpt_dir}")
+}
+
+start_checkpoint_watcher() {
+  local exp_name="$1"
+  bool_is_true "${SERIAL_CONVERT_SAVED_CKPTS_TO_HF}" || return 0
+  bool_is_true "${DRY_RUN:-0}" && return 0
+  if [[ -n "${SERIAL_CKPT_WATCHER_PID}" ]] && kill -0 "${SERIAL_CKPT_WATCHER_PID}" 2>/dev/null; then
+    return 0
+  fi
+
+  local ckpt_dir="${SAVE_DIR}/checkpoints/${exp_name}"
+  local log_file="${EVAL_LOG_DIR}/${exp_name}.checkpoint_convert.log"
+  mkdir -p "${ckpt_dir}" "$(dirname "${log_file}")"
+
+  SERIAL_CKPT_WATCHER_STOP_FILE="${TMP_DIR}/.checkpoint_watcher_stop_${exp_name}"
+  rm -f "${SERIAL_CKPT_WATCHER_STOP_FILE}"
+
+  (
+    activate_conda
+    apply_network_env
+    export CUDA_VISIBLE_DEVICES=""
+    log "[ckpt-watcher] 启动: ${exp_name}, interval=${SERIAL_CKPT_CONVERT_INTERVAL_SECONDS}s"
+    while [[ ! -f "${SERIAL_CKPT_WATCHER_STOP_FILE}" ]]; do
+      serial_scan_checkpoints_once "${exp_name}" || true
+      sleep "${SERIAL_CKPT_CONVERT_INTERVAL_SECONDS}" || true
+    done
+    serial_scan_checkpoints_once "${exp_name}" || true
+    log "[ckpt-watcher] 退出: ${exp_name}"
+  ) >> "${log_file}" 2>&1 &
+  SERIAL_CKPT_WATCHER_PID="$!"
+  log "启动 checkpoint 转换 watcher (PID=${SERIAL_CKPT_WATCHER_PID}): ${exp_name}, 日志: ${log_file}"
+}
+
+stop_checkpoint_watcher() {
+  if [[ -n "${SERIAL_CKPT_WATCHER_STOP_FILE}" ]]; then
+    touch "${SERIAL_CKPT_WATCHER_STOP_FILE}"
+  fi
+}
+
+wait_checkpoint_watcher() {
+  if [[ -n "${SERIAL_CKPT_WATCHER_PID}" ]]; then
+    wait "${SERIAL_CKPT_WATCHER_PID}" 2>/dev/null || true
+  fi
+  SERIAL_CKPT_WATCHER_PID=""
+  SERIAL_CKPT_WATCHER_STOP_FILE=""
+}
+
+ensure_hf_checkpoint_ready() {
+  local exp_name="$1"
+  local step="$2"
+  local ckpt_dir="${SAVE_DIR}/checkpoints/${exp_name}"
+  local hf_dir="${ckpt_dir}/global_step_${step}_hf"
+  local lock_dir="${ckpt_dir}/.merge_global_step_${step}.running"
+  local waited=0
+
+  serial_hf_model_is_ready "${hf_dir}" && return 0
+
+  while [[ -d "${lock_dir}" && "${waited}" -lt 3600 ]]; do
+    serial_hf_model_is_ready "${hf_dir}" && return 0
+    sleep 10
+    waited=$((waited + 10))
+  done
+
+  if ! bool_is_true "${DRY_RUN:-0}"; then
+    activate_conda
+    apply_network_env
+  fi
+  serial_merge_checkpoint_to_hf "${exp_name}" "${step}"
+  serial_hf_model_is_ready "${hf_dir}" || die "最佳 checkpoint 的推理格式目录不可用: ${hf_dir}"
 }
 
 select_best_checkpoint_step() {
@@ -142,6 +398,14 @@ if keep_count < 1:
 ckpt_dir = Path(ckpt_dir)
 
 
+def hf_model_is_ready(path):
+    if not (path / "config.json").is_file():
+        return False
+    has_weight = any(path.glob("*.safetensors")) or any(path.glob("*.bin"))
+    has_tokenizer = any((path / name).is_file() for name in ("tokenizer.json", "tokenizer.model", "vocab.json"))
+    return has_weight and has_tokenizer
+
+
 def to_float(value):
     if value in (None, ""):
         return None
@@ -160,11 +424,11 @@ with open(metrics_csv, encoding="utf-8", newline="") as f:
     rows = list(reader)
 
 mean_suffix = f"/mean@{k}"
-mean_pattern = re.compile(rf"^val-core/[^/]+/(acc|reward){re.escape(mean_suffix)}$")
+mean_pattern = re.compile(rf"^val-core/.+/acc{re.escape(mean_suffix)}$")
 mean_cols = [name for name in fieldnames if mean_pattern.match(name)]
 
 if not mean_cols:
-    raise SystemExit(f"{metrics_csv} 缺少 val-core/*/{{acc|reward}}/mean@{k} 列；请确认 VAL_KWARGS_N={k}")
+    raise SystemExit(f"{metrics_csv} 缺少 val-core/**/acc/mean@{k} 列；请确认 VAL_KWARGS_N={k}")
 
 candidates = []
 for row in rows:
@@ -173,7 +437,8 @@ for row in rows:
         continue
     step = int(step_value)
     actor_dir = ckpt_dir / f"global_step_{step}" / "actor"
-    if not actor_dir.is_dir():
+    hf_dir = ckpt_dir / f"global_step_{step}_hf"
+    if not actor_dir.is_dir() and not hf_model_is_ready(hf_dir):
         continue
 
     mean_values = [to_float(row.get(col)) for col in mean_cols]
@@ -181,20 +446,20 @@ for row in rows:
     if not mean_values:
         continue
 
-    mean16 = sum(mean_values) / len(mean_values)
-    score = mean16
-    candidates.append((score, step, mean16, len(mean_values)))
+    mean_acc = sum(mean_values) / len(mean_values)
+    score = mean_acc
+    candidates.append((score, step, mean_acc, len(mean_values)))
 
 if not candidates:
-    raise SystemExit(f"{metrics_csv} 中没有同时具备 checkpoint 和 val-core/*/{{acc|reward}}/mean@{k} 的 step")
+    raise SystemExit(f"{metrics_csv} 中没有同时具备训练格式/HF checkpoint 和 val-core/**/acc/mean@{k} 的 step")
 
 candidates.sort(key=lambda candidate: (candidate[0], candidate[1]), reverse=True)
-score, step, mean16, mean_count = candidates[0]
+score, step, mean_acc, mean_count = candidates[0]
 top_steps = [str(candidate[1]) for candidate in candidates[:keep_count]]
 env_lines = {
     "BEST_STEP": str(step),
     "BEST_SCORE": f"{score:.12g}",
-    "BEST_MEAN16": f"{mean16:.12g}",
+    "BEST_MEAN_ACC": f"{mean_acc:.12g}",
     "BEST_MEAN_COLUMN_COUNT": str(mean_count),
     "BEST_TOP_STEPS": " ".join(top_steps),
 }
@@ -205,7 +470,7 @@ print(step)
 PY
   # shellcheck source=/dev/null
   source "${best_env}"
-  log "最佳 checkpoint: ${exp_name} step=${BEST_STEP}, val-core mean@${SERIAL_BEST_K}=${BEST_MEAN16}, score=${BEST_SCORE}, 保留前${SERIAL_BEST_CKPTS_TO_KEEP}=${BEST_TOP_STEPS}"
+  log "最佳 checkpoint: ${exp_name} step=${BEST_STEP}, val-core acc mean@${SERIAL_BEST_K}=${BEST_MEAN_ACC}, score=${BEST_SCORE}, top${SERIAL_BEST_CKPTS_TO_KEEP}=${BEST_TOP_STEPS}"
 }
 
 prune_checkpoints_to_best_steps() {
@@ -261,6 +526,7 @@ write_formal_eval_config() {
     write_config_assignment "FORMAL_EVAL_INCLUDE_BASELINE_ENTROPY" "0"
     write_config_assignment "FORMAL_EVAL_INCLUDE_GAMMA_SEARCH" "0"
     write_config_assignment "FORMAL_EVAL_MAIN_ALGORITHMS" ""
+    write_config_assignment "MAIN_SIMILARITY_ALGORITHMS" ""
     write_config_assignment "FORMAL_EVAL_CHECKPOINT_STEP" "${step}"
     write_config_assignment "FORMAL_EVAL_OUTPUT_SUBDIR" "${output_subdir}"
     write_config_assignment "FORMAL_EVAL_GPUS" "${FORMAL_EVAL_GPUS:-${CUDA_VISIBLE_DEVICES}}"
@@ -317,16 +583,31 @@ run_serial_experiment() {
 
   parse_experiment_spec "${spec}" exp_name algorithm tau
   log "串行队列启动训练: exp=${exp_name}, algorithm=${algorithm}, tau=${tau}, steps=${SERIAL_TRAINING_STEPS}"
+  start_checkpoint_watcher "${exp_name}"
+
+  local saved_max_actor="${MAX_ACTOR_CKPT_TO_KEEP:-0}"
+  local saved_max_critic="${MAX_CRITIC_CKPT_TO_KEEP:-0}"
+  if bool_is_true "${SERIAL_CONVERT_SAVED_CKPTS_TO_HF}"; then
+    # 由后台转换器在 HF checkpoint 落盘后清理训练格式 checkpoint，避免训练进程先轮转掉尚未转换的旧 step。
+    MAX_ACTOR_CKPT_TO_KEEP=0
+    MAX_CRITIC_CKPT_TO_KEEP=0
+  fi
   run_experiment "${exp_name}" "${algorithm}" "${tau}" "${SERIAL_TRAINING_STEPS}" "0.0" "" "" "1.0"
+  MAX_ACTOR_CKPT_TO_KEEP="${saved_max_actor}"
+  MAX_CRITIC_CKPT_TO_KEEP="${saved_max_critic}"
   wait_eval_bg
 
   if bool_is_true "${DRY_RUN:-0}"; then
     log "DRY_RUN=1，跳过最佳 checkpoint 选择和全量评测: ${exp_name}"
+    stop_checkpoint_watcher
+    wait_checkpoint_watcher
     return 0
   fi
 
   select_best_checkpoint_step "${exp_name}"
-  prune_checkpoints_to_best_steps "${exp_name}" "${BEST_TOP_STEPS}"
+  stop_checkpoint_watcher
+  wait_checkpoint_watcher
+  ensure_hf_checkpoint_ready "${exp_name}" "${BEST_STEP}"
   run_formal_eval_for_best_step "${exp_name}" "${BEST_STEP}"
 }
 
@@ -338,8 +619,12 @@ main() {
   TOTAL_TRAINING_STEPS="${SERIAL_TRAINING_STEPS}"
   TEST_FREQ="${SERIAL_TEST_FREQ}"
   SAVE_FREQ="${SERIAL_SAVE_FREQ}"
-  MAX_ACTOR_CKPT_TO_KEEP="${SERIAL_MAX_CKPTS_TO_KEEP}"
-  MAX_CRITIC_CKPT_TO_KEEP="${SERIAL_MAX_CKPTS_TO_KEEP}"
+  serial_validate_nonnegative_int "SERIAL_MAX_ACTOR_CKPTS_TO_KEEP" "${SERIAL_MAX_ACTOR_CKPTS_TO_KEEP}"
+  serial_validate_nonnegative_int "SERIAL_MAX_CRITIC_CKPTS_TO_KEEP" "${SERIAL_MAX_CRITIC_CKPTS_TO_KEEP}"
+  MAX_ACTOR_CKPT_TO_KEEP="${SERIAL_MAX_ACTOR_CKPTS_TO_KEEP}"
+  MAX_CRITIC_CKPT_TO_KEEP="${SERIAL_MAX_CRITIC_CKPTS_TO_KEEP}"
+  SERIAL_TRAIN_FORMAT_ACTOR_KEEP="${MAX_ACTOR_CKPT_TO_KEEP}"
+  SERIAL_TRAIN_FORMAT_CRITIC_KEEP="${MAX_CRITIC_CKPT_TO_KEEP}"
   VAL_KWARGS_N="${SERIAL_BEST_K}"
   RUN_EVAL_AFTER_TRAIN=1
 
@@ -347,7 +632,8 @@ main() {
   prepare_dirs
   apply_network_env
 
-  log "串行 AER 训练配置: steps=${TOTAL_TRAINING_STEPS}, test_freq=${TEST_FREQ}, save_freq=${SAVE_FREQ}, max_ckpts=${MAX_ACTOR_CKPT_TO_KEEP}, best_ckpts_to_keep=${SERIAL_BEST_CKPTS_TO_KEEP}"
+  log "串行 AER 训练配置: steps=${TOTAL_TRAINING_STEPS}, test_freq=${TEST_FREQ}, save_freq=${SAVE_FREQ}, train_ckpt_keep(actor=${SERIAL_TRAIN_FORMAT_ACTOR_KEEP}, critic=${SERIAL_TRAIN_FORMAT_CRITIC_KEEP}), best_top=${SERIAL_BEST_CKPTS_TO_KEEP}"
+  log "checkpoint 推理格式转换: enabled=${SERIAL_CONVERT_SAVED_CKPTS_TO_HF}, delete_train_after_hf=${SERIAL_DELETE_TRAIN_CKPT_AFTER_HF}, interval=${SERIAL_CKPT_CONVERT_INTERVAL_SECONDS}s"
   log "训练期间 CPU 评测指标: metrics=${AFTER_TRAIN_EVAL_METRICS}, ks=${AFTER_TRAIN_EVAL_KS}, semantic_device=${AFTER_TRAIN_EVAL_SEMANTIC_DEVICE:-cpu}"
 
   local spec

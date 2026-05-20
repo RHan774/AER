@@ -339,6 +339,12 @@ discover_formal_experiments_from_dirs() {
 
 collect_formal_experiments() {
   FORMAL_EXPS=()
+  local formal_main_algorithms
+  if [[ ${FORMAL_EVAL_MAIN_ALGORITHMS+x} ]]; then
+    formal_main_algorithms="${FORMAL_EVAL_MAIN_ALGORITHMS}"
+  else
+    formal_main_algorithms="${MAIN_SIMILARITY_ALGORITHMS:-}"
+  fi
 
   local exp_name
   for exp_name in ${FORMAL_EVAL_EXPERIMENT_NAMES:-}; do
@@ -353,7 +359,7 @@ collect_formal_experiments() {
   fi
 
   local gamma_best=""
-  if [[ "${FORMAL_EVAL_INCLUDE_GAMMA_SEARCH:-best}" != "0" || -n "${FORMAL_EVAL_MAIN_ALGORITHMS:-}" ]]; then
+  if [[ "${FORMAL_EVAL_INCLUDE_GAMMA_SEARCH:-best}" != "0" || -n "${formal_main_algorithms}" ]]; then
     gamma_best="$(resolve_gamma_best)"
   fi
 
@@ -371,7 +377,7 @@ collect_formal_experiments() {
   fi
 
   local algorithm
-  for algorithm in ${FORMAL_EVAL_MAIN_ALGORITHMS:-${MAIN_SIMILARITY_ALGORITHMS:-}}; do
+  for algorithm in ${formal_main_algorithms}; do
     local tau
     tau="$(read_tau_for_gamma "${algorithm}" "${gamma_best}")"
     if [[ "${algorithm}" == "${TARGET_SIMILARITY_FOR_GAMMA_SEARCH}" ]] && bool_is_true "${FORMAL_EVAL_REUSE_GAMMA_SEARCH_FOR_TARGET:-${REUSE_GAMMA_SEARCH_FOR_TARGET:-1}}"; then
@@ -391,6 +397,13 @@ collect_formal_experiments() {
 }
 
 print_status() {
+  local formal_main_algorithms
+  if [[ ${FORMAL_EVAL_MAIN_ALGORITHMS+x} ]]; then
+    formal_main_algorithms="${FORMAL_EVAL_MAIN_ALGORITHMS}"
+  else
+    formal_main_algorithms="${MAIN_SIMILARITY_ALGORITHMS:-}"
+  fi
+
   cat <<EOF
 REPO_ROOT=${REPO_ROOT}
 CONFIG_FILE=${CONFIG_FILE}
@@ -403,7 +416,7 @@ TOTAL_TRAINING_STEPS=${TOTAL_TRAINING_STEPS}
 FORMAL_EVAL_INCLUDE_BASELINE_NAIVE=${FORMAL_EVAL_INCLUDE_BASELINE_NAIVE:-1}
 FORMAL_EVAL_INCLUDE_BASELINE_ENTROPY=${FORMAL_EVAL_INCLUDE_BASELINE_ENTROPY:-1}
 FORMAL_EVAL_INCLUDE_GAMMA_SEARCH=${FORMAL_EVAL_INCLUDE_GAMMA_SEARCH:-best}
-FORMAL_EVAL_MAIN_ALGORITHMS=${FORMAL_EVAL_MAIN_ALGORITHMS:-${MAIN_SIMILARITY_ALGORITHMS:-}}
+FORMAL_EVAL_MAIN_ALGORITHMS=${formal_main_algorithms}
 TARGET_SIMILARITY_FOR_GAMMA_SEARCH=${TARGET_SIMILARITY_FOR_GAMMA_SEARCH}
 GAMMA_BEST=${GAMMA_BEST}
 EVAL_RERUN_METRICS=${EVAL_RERUN_METRICS}
@@ -496,6 +509,10 @@ merge_checkpoint_if_needed() {
 
   if hf_model_is_ready "${hf_dir}" && ! bool_is_true "${EVAL_FORCE_MERGE:-${FORCE_RERUN:-0}}"; then
     log "HF 模型已存在，跳过合并: ${hf_dir}"
+    return 0
+  fi
+  if hf_model_is_ready "${hf_dir}" && [[ ! -d "${actor_dir}" ]]; then
+    log "HF 模型已存在且训练格式 checkpoint 已清理，直接使用: ${hf_dir}"
     return 0
   fi
 
