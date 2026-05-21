@@ -14,6 +14,8 @@ from recipe.aer.eval.eval_from_model import infer_samples_per_prompt  # noqa: E4
 from recipe.aer.eval.evaluator import evaluate_records  # noqa: E402
 from recipe.aer.eval.metrics.pass_at_k import pass_at_k_unbiased  # noqa: E402
 from recipe.aer.eval.metrics.registry import parse_metric_names  # noqa: E402
+from recipe.aer.eval.metrics.self_bleu import bleu_score, self_bleu  # noqa: E402
+from recipe.aer.eval.metrics.text import tokenize  # noqa: E402
 from recipe.aer.eval.train_log import export_tau_plan, parse_train_log  # noqa: E402
 
 
@@ -107,6 +109,22 @@ class EvaluateAERTest(unittest.TestCase):
         self.assertEqual(infer_samples_per_prompt(parse_metric_names("distinct-2,self-bleu"), [1, 2, 4]), 1)
         self.assertEqual(infer_samples_per_prompt(parse_metric_names("first@1"), [1, 2, 4]), 1)
         self.assertEqual(infer_samples_per_prompt(parse_metric_names("first@1"), [1, 2, 4], explicit_samples_per_prompt=3), 3)
+
+    def test_self_bleu_matches_candidate_bleu_average(self):
+        texts = [
+            "We solve x + 1 = 2, so x = 1.",
+            "Solving x+1=2 gives x=1.",
+            "A different path still gives the final answer 1.",
+            "By subtraction, the unknown value is 1.",
+        ]
+        tokenized = [tokenize(text) for text in texts]
+        scores = []
+        for idx, candidate in enumerate(tokenized):
+            references = [tokens for ref_idx, tokens in enumerate(tokenized) if ref_idx != idx]
+            score = bleu_score(candidate, references, max_order=4)
+            if score is not None:
+                scores.append(score)
+        self.assertAlmostEqual(self_bleu(texts, max_order=4), sum(scores) / len(scores))
 
     def test_validation_groups_by_unique_id_before_prompt_text(self):
         records = [
